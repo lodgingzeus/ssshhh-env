@@ -1,0 +1,36 @@
+# --- Secrets & runtime data: NEVER commit these ---
+*.key
+*.pem
+master.key
+host_ed25519*
+ssh_host_*
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+.env
+.env.*
+!.env.example
+
+# --- Go ---
+/bin/
+/ssshhh-env
+/dist/
+*.exe
+*.test
+*.out
+coverage.*
+go.work
+go.work.sum
+
+# --- Nix ---
+result
+result-*
+.direnv/
+
+# --- Editors / OS ---
+.idea/
+.vscode/
+*.swp
+.DS_Store
