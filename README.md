@@ -62,6 +62,17 @@ go test -race ./...
 
 Without Nix, install Go and use the same `go` commands.
 
+To run the server locally, allow your own key, then start it:
+
+```bash
+mkdir -m 700 data
+echo "$(cut -d' ' -f1,2 ~/.ssh/id_ed25519.pub) $USER" > data/authorized_keys
+chmod 600 data/authorized_keys
+go run ./cmd/ssshhh-env serve          # listens on :2222, prints the host key fingerprint
+
+ssh -p 2222 localhost whoami
+```
+
 ## License
 
 [Apache-2.0](LICENSE)
