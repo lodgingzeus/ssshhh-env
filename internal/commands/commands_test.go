@@ -86,19 +86,27 @@ func TestCommandTable(t *testing.T) {
 		if !authz.Can(everything, c.action, authz.RoleOwner) {
 			t.Errorf("command %q: action %q is not in the authz policy", c.name, c.action)
 		}
-		if string(c.action) != c.name {
+		// Grouped account commands ("user add") share one action.
+		if grouped := strings.Contains(c.name, " "); grouped && c.action != authz.ManageUsers || !grouped && string(c.action) != c.name {
 			t.Errorf("command %q is checked as action %q", c.name, c.action)
 		}
 		// A command that needs a project role must say so, or Run would
 		// check it with no role and refuse everyone.
 		needsRole := !authz.Can(everything, c.action, authz.RoleNone)
-		if needsRole != c.project {
-			t.Errorf("command %q: project = %v, but its action needs a project role = %v", c.name, c.project, needsRole)
+		if needsRole != (c.scope != scopeNone) {
+			t.Errorf("command %q: scope = %v, but its action needs a project role = %v", c.name, c.scope, needsRole)
 		}
-		if c.project && !strings.HasPrefix(c.args, "<project") {
-			t.Errorf("command %q: a project command's first argument must be the target, got %q", c.name, c.args)
+		switch c.scope {
+		case scopeTarget:
+			if !strings.HasPrefix(c.args, "<project[:env]>") {
+				t.Errorf("command %q: first argument must be <project[:env]>, got %q", c.name, c.args)
+			}
+		case scopeProject:
+			if !strings.HasPrefix(c.args, "<project>") {
+				t.Errorf("command %q: first argument must be <project>, got %q", c.name, c.args)
+			}
 		}
-		if Name([]string{c.name}) != c.name {
+		if Name(Split(c.name)) != c.name {
 			t.Errorf("Name does not recognise %q", c.name)
 		}
 		if !strings.Contains(helpText(), c.usage()) {

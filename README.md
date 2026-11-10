@@ -11,7 +11,8 @@ ssshhh-env is a self-hosted SSH server that lets a small team store, share and v
 ```bash
 # Team lead, once
 cat .env | ssh envs.myteam.dev push myapp
-ssh envs.myteam.dev grant myapp @rahul @priya      # fetches and pins their GitHub keys
+ssh envs.myteam.dev grant myapp @rahul             # fetches and pins their GitHub keys
+ssh envs.myteam.dev grant myapp @priya --role writer
 
 # Any teammate
 ssh envs.myteam.dev pull myapp > .env

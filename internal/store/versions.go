@@ -133,3 +133,58 @@ func (s *Store) version(ctx context.Context, suffix string, args ...any) (Versio
 	}
 	return v, nil
 }
+
+// VersionInfo is a version's metadata, without its ciphertext.
+type VersionInfo struct {
+	Number    int64
+	SizeBytes int64
+	KeyNames  []string
+	Author    string // user name
+	Message   string
+	CreatedAt string
+}
+
+// ListVersions returns up to limit of the environment's newest versions,
+// newest first, without their ciphertext. It fails with ErrNotFound if the
+// environment does not exist.
+func (s *Store) ListVersions(ctx context.Context, projectID int64, envName string, limit int) ([]VersionInfo, error) {
+	if limit <= 0 {
+		return nil, errors.New("list versions: limit must be positive")
+	}
+	var envID int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id FROM environments WHERE project_id = ? AND name = ?`, projectID, envName).Scan(&envID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("list versions: %w", err)
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT v.version, v.size_bytes, v.key_names_json, u.name, v.message, v.created_at
+		FROM versions v JOIN users u ON u.id = v.author_id
+		WHERE v.env_id = ?
+		ORDER BY v.version DESC LIMIT ?`, envID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list versions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []VersionInfo
+	for rows.Next() {
+		var (
+			v         VersionInfo
+			namesJSON string
+		)
+		if err := rows.Scan(&v.Number, &v.SizeBytes, &namesJSON, &v.Author, &v.Message, &v.CreatedAt); err != nil {
+			return nil, fmt.Errorf("list versions: %w", err)
+		}
+		if err := json.Unmarshal([]byte(namesJSON), &v.KeyNames); err != nil {
+			return nil, fmt.Errorf("list versions: key names: %w", err)
+		}
+		out = append(out, v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list versions: %w", err)
+	}
+	return out, nil
+}

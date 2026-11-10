@@ -7,8 +7,13 @@ import (
 	"fmt"
 )
 
-// ErrAlreadyBootstrapped is returned by BootstrapAdmin when users exist.
-var ErrAlreadyBootstrapped = errors.New("users already exist")
+var (
+	// ErrAlreadyBootstrapped is returned by BootstrapAdmin when users exist.
+	ErrAlreadyBootstrapped = errors.New("users already exist")
+	// ErrLastAdmin is returned when a change would leave no enabled server
+	// admin.
+	ErrLastAdmin = errors.New("no enabled admin would be left")
+)
 
 // Key sources.
 const (
@@ -59,7 +64,9 @@ func (s *Store) CountUsers(ctx context.Context) (int, error) {
 	return n, err
 }
 
-// CreateUser creates a user with at least one key, atomically.
+// CreateUser creates a user with at least one key, atomically. It fails
+// with ErrExists if the name is taken (names are case-insensitive) and with
+// ErrKeyInUse if a key is registered already.
 func (s *Store) CreateUser(ctx context.Context, u NewUser, keys []NewKey) (User, error) {
 	return s.createUser(ctx, u, keys, false)
 }
@@ -91,6 +98,17 @@ func (s *Store) createUser(ctx context.Context, u NewUser, keys []NewKey, onlyIf
 		}
 	}
 
+	var taken bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM users WHERE name = ?)`, u.Name).Scan(&taken); err != nil {
+		return User{}, fmt.Errorf("create user: %w", err)
+	}
+	if taken {
+		return User{}, ErrExists
+	}
+	if err := keysFree(ctx, tx, keys); err != nil {
+		return User{}, err
+	}
+
 	now := s.timestamp()
 	res, err := tx.ExecContext(ctx,
 		`INSERT INTO users (name, github_login, is_admin, created_at) VALUES (?, ?, ?, ?)`,
@@ -102,12 +120,8 @@ func (s *Store) createUser(ctx context.Context, u NewUser, keys []NewKey, onlyIf
 	if err != nil {
 		return User{}, fmt.Errorf("create user: %w", err)
 	}
-	for _, k := range keys {
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO keys (user_id, fingerprint_sha256, public_key, key_type, source, added_at) VALUES (?, ?, ?, ?, ?, ?)`,
-			id, k.Fingerprint, k.PublicKey, k.KeyType, k.Source, now); err != nil {
-			return User{}, fmt.Errorf("add key %s: %w", k.Fingerprint, err)
-		}
+	if err := insertKeys(ctx, tx, id, keys, now); err != nil {
+		return User{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return User{}, fmt.Errorf("create user: %w", err)
@@ -116,15 +130,39 @@ func (s *Store) createUser(ctx context.Context, u NewUser, keys []NewKey, onlyIf
 }
 
 // DisableUser marks a user as disabled. Their keys stop authenticating
-// immediately.
+// immediately. It fails with ErrNotFound if there is no such enabled user,
+// and with ErrLastAdmin if they are the only enabled server admin: with no
+// admin left, nobody could manage accounts or create projects.
 func (s *Store) DisableUser(ctx context.Context, userID int64) error {
-	res, err := s.db.ExecContext(ctx,
-		`UPDATE users SET disabled_at = ? WHERE id = ? AND disabled_at IS NULL`, s.timestamp(), userID)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("disable user: %w", err)
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
+	defer func() { _ = tx.Rollback() }()
+
+	var isAdmin bool
+	err = tx.QueryRowContext(ctx, `SELECT is_admin FROM users WHERE id = ? AND disabled_at IS NULL`, userID).Scan(&isAdmin)
+	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("disable user: %w", err)
+	}
+	if isAdmin {
+		var admins int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM users WHERE is_admin = 1 AND disabled_at IS NULL`).Scan(&admins); err != nil {
+			return fmt.Errorf("disable user: %w", err)
+		}
+		if admins <= 1 {
+			return ErrLastAdmin
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE users SET disabled_at = ? WHERE id = ?`, s.timestamp(), userID); err != nil {
+		return fmt.Errorf("disable user: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("disable user: %w", err)
 	}
 	return nil
 }

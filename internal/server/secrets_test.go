@@ -219,6 +219,20 @@ func TestCanaryNeverLeaks(t *testing.T) {
 		{root, "pull other", "", false},
 		{alice, "pull other", "", false},
 		{root, "pull app --version x", "", false},
+		// Team commands, including diff, which decrypts both versions.
+		{root, "push app -m second", strings.Replace(env, canary, canary+"2", 1), false},
+		{root, "history app", "", false},
+		{alice, "history app", "", false},
+		{root, "diff app 1 2", "", false},
+		{alice, "diff app 2 1", "", false},
+		{root, "diff app 1 9", "", false},
+		{root, "members app", "", false},
+		{root, "projects", "", false},
+		{root, "grant app alice --role writer", "", false},
+		{alice, "diff app 1 2", "", false},
+		{root, "revoke app alice", "", false},
+		{alice, "history app", "", false},
+		{alice, "diff app 1 2", "", false},
 	}
 	var elsewhere strings.Builder
 	for _, s := range steps {

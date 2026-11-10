@@ -3,6 +3,8 @@ package commands
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"fmt"
 	"io"
 	"log/slog"
@@ -11,18 +13,22 @@ import (
 	"strings"
 	"testing"
 
+	gossh "golang.org/x/crypto/ssh"
+
 	"github.com/lodgingzeus/ssshhh-env/internal/auth"
 	"github.com/lodgingzeus/ssshhh-env/internal/crypto"
+	"github.com/lodgingzeus/ssshhh-env/internal/github"
 	"github.com/lodgingzeus/ssshhh-env/internal/store"
 )
 
 // testEnv is a real store and master key with three users: root (a server
 // admin), and alice and bob (not admins).
 type testEnv struct {
-	deps Deps
-	st   *store.Store
-	logs *bytes.Buffer
-	root auth.Identity
+	deps   Deps
+	github *fakeGitHub
+	st     *store.Store
+	logs   *bytes.Buffer
+	root   auth.Identity
 	alice,
 	bob auth.Identity
 }
@@ -39,8 +45,8 @@ func newTestEnv(t *testing.T) *testEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e := &testEnv{st: st, logs: &bytes.Buffer{}}
-	e.deps = Deps{Store: st, MasterKey: mk, Log: slog.New(slog.NewTextHandler(e.logs, nil))}
+	e := &testEnv{st: st, logs: &bytes.Buffer{}, github: &fakeGitHub{users: map[string][]gossh.PublicKey{}}}
+	e.deps = Deps{Store: st, MasterKey: mk, GitHub: e.github, Log: slog.New(slog.NewTextHandler(e.logs, nil))}
 
 	user := func(name string, admin bool) auth.Identity {
 		key := store.NewKey{Fingerprint: "SHA256:" + name, PublicKey: "ssh-ed25519 AAAA" + name, KeyType: "ssh-ed25519", Source: store.SourceManual}
@@ -106,4 +112,49 @@ func (e *testEnv) push(t *testing.T, target, content string, extra ...string) {
 	if res, _, stderr := e.run(e.root, content, append([]string{"push", target}, extra...)...); res.Code != 0 {
 		t.Fatalf("push %s: %s", target, stderr)
 	}
+}
+
+// fakeGitHub serves keys from a map and counts fetches.
+type fakeGitHub struct {
+	users   map[string][]gossh.PublicKey // by lowercase login
+	err     error                        // returned for every fetch, if set
+	fetches int
+}
+
+func (f *fakeGitHub) Keys(_ context.Context, login string) ([]gossh.PublicKey, error) {
+	f.fetches++
+	if f.err != nil {
+		return nil, f.err
+	}
+	keys, ok := f.users[strings.ToLower(login)]
+	if !ok {
+		return nil, github.ErrUserNotFound
+	}
+	if len(keys) == 0 {
+		return nil, github.ErrNoKeys
+	}
+	return keys, nil
+}
+
+// newPubKey returns a fresh ed25519 public key.
+func newPubKey(t *testing.T) gossh.PublicKey {
+	t.Helper()
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k, err := gossh.NewPublicKey(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return k
+}
+
+// authorizedKeys formats keys as a .pub file would hold them.
+func authorizedKeys(keys ...gossh.PublicKey) string {
+	var b strings.Builder
+	for _, k := range keys {
+		b.Write(gossh.MarshalAuthorizedKey(k))
+	}
+	return b.String()
 }

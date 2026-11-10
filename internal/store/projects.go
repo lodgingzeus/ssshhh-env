@@ -10,13 +10,6 @@ import (
 // ErrExists is returned when a row with the same unique name already exists.
 var ErrExists = errors.New("already exists")
 
-// Member roles, as stored in members.role.
-const (
-	RoleOwner  = "owner"
-	RoleWriter = "writer"
-	RoleReader = "reader"
-)
-
 // Project is a named set of environments sharing one data key. The key is
 // held only in wrapped form.
 type Project struct {
@@ -98,37 +91,6 @@ func (s *Store) ProjectByName(ctx context.Context, name string) (Project, error)
 		return Project{}, fmt.Errorf("look up project: %w", err)
 	}
 	return p, nil
-}
-
-// AddMember gives a user a role in a project. It fails with ErrExists if
-// they are already a member; changing a role is a separate, explicit step.
-func (s *Store) AddMember(ctx context.Context, projectID, userID int64, role string, grantedBy int64) error {
-	res, err := s.db.ExecContext(ctx, `
-		INSERT INTO members (project_id, user_id, role, granted_by, granted_at) VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT (project_id, user_id) DO NOTHING`,
-		projectID, userID, role, grantedBy, s.timestamp())
-	if err != nil {
-		return fmt.Errorf("add member: %w", err)
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrExists
-	}
-	return nil
-}
-
-// MemberRole returns the user's role in the project, or ErrNotFound if they
-// are not a member.
-func (s *Store) MemberRole(ctx context.Context, projectID, userID int64) (string, error) {
-	var role string
-	err := s.db.QueryRowContext(ctx,
-		`SELECT role FROM members WHERE project_id = ? AND user_id = ?`, projectID, userID).Scan(&role)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", ErrNotFound
-	}
-	if err != nil {
-		return "", fmt.Errorf("look up member: %w", err)
-	}
-	return role, nil
 }
 
 // MasterKeyIDs returns the ids of the master keys that projects' data keys

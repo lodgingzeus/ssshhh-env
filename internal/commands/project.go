@@ -11,10 +11,10 @@ import (
 // runInit creates a project with a fresh data key. The creator becomes its
 // owner, which is the only way a server admin gets access to a project.
 func runInit(ctx context.Context, d Deps, inv *invocation) Result {
-	if len(inv.Args) != 2 {
+	if len(inv.Params) != 1 {
 		return inv.usageError()
 	}
-	name := inv.Args[1]
+	name := inv.Params[0]
 	if !ValidName(name) {
 		return inv.refuse("invalid project name", errBadTarget.Error())
 	}

@@ -45,6 +45,29 @@ func (e *SyntaxError) Error() string { return fmt.Sprintf("line %d: %s", e.Line,
 // matching closing quote, which may be on a later line. Anything else is
 // refused, as are duplicate names and files with no variables at all.
 func Parse(data []byte) ([]string, error) {
+	entries, err := scan(data)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.name)
+	}
+	slices.Sort(names)
+	return names, nil
+}
+
+// entry is one variable: its name and the raw text of its value. A quoted
+// value includes its quotes; trailing comments after them are not part of
+// it.
+type entry struct {
+	name  string
+	value []byte
+}
+
+// scan validates data and returns its variables in file order. It is the
+// only parser: Parse and Diff both use it.
+func scan(data []byte) ([]entry, error) {
 	switch {
 	case len(data) > MaxSize:
 		return nil, ErrTooLarge
@@ -60,7 +83,7 @@ func Parse(data []byte) ([]string, error) {
 
 	lines := bytes.Split(data, []byte("\n"))
 	seen := map[string]bool{}
-	var names []string
+	var entries []entry
 	for i := 0; i < len(lines); i++ {
 		line := bytes.TrimSpace(lines[i])
 		if len(line) == 0 || line[0] == '#' {
@@ -77,21 +100,20 @@ func Parse(data []byte) ([]string, error) {
 			return nil, &SyntaxError{Line: i + 1, Reason: "variable is set more than once"}
 		}
 		seen[string(name)] = true
-		names = append(names, string(name))
 
 		if len(value) > 0 && (value[0] == '"' || value[0] == '\'') {
-			end, err := skipQuoted(lines, i, value)
+			end, quoted, err := skipQuoted(lines, i, value)
 			if err != nil {
 				return nil, err
 			}
-			i = end
+			i, value = end, quoted
 		}
+		entries = append(entries, entry{name: string(name), value: value})
 	}
-	if len(names) == 0 {
+	if len(entries) == 0 {
 		return nil, ErrEmpty
 	}
-	slices.Sort(names)
-	return names, nil
+	return entries, nil
 }
 
 // splitAssignment splits a trimmed line into the name and the value, with
@@ -125,10 +147,11 @@ func validName(b []byte) bool {
 }
 
 // skipQuoted finds the end of a quoted value that starts on lines[start]
-// with value, and returns the index of the line holding the closing quote.
-// Inside double quotes a backslash escapes the next character; single
-// quotes have no escapes. Only a comment may follow the closing quote.
-func skipQuoted(lines [][]byte, start int, value []byte) (int, error) {
+// with value. It returns the index of the line holding the closing quote
+// and the value's text from the opening quote to the closing one. Inside
+// double quotes a backslash escapes the next character; single quotes have
+// no escapes. Only a comment may follow the closing quote.
+func skipQuoted(lines [][]byte, start int, value []byte) (int, []byte, error) {
 	quote := value[0]
 	rest := value[1:]
 	for i := start; ; i++ {
@@ -138,14 +161,27 @@ func skipQuoted(lines [][]byte, start int, value []byte) (int, error) {
 		if end := closingQuote(rest, quote); end >= 0 {
 			tail := bytes.TrimSpace(rest[end+1:])
 			if len(tail) > 0 && tail[0] != '#' {
-				return 0, &SyntaxError{Line: i + 1, Reason: "unexpected text after the closing quote"}
+				return 0, nil, &SyntaxError{Line: i + 1, Reason: "unexpected text after the closing quote"}
 			}
-			return i, nil
+			return i, quotedText(lines, start, i, value, end), nil
 		}
 		if i == len(lines)-1 {
-			return 0, &SyntaxError{Line: start + 1, Reason: "quote is never closed"}
+			return 0, nil, &SyntaxError{Line: start + 1, Reason: "quote is never closed"}
 		}
 	}
+}
+
+// quotedText joins a quoted value that opens on lines[start] (as value)
+// and closes at index end of lines[last] (index end+1 of value if last is
+// start, since value still holds the opening quote).
+func quotedText(lines [][]byte, start, last int, value []byte, end int) []byte {
+	if last == start {
+		return value[:end+2]
+	}
+	parts := [][]byte{value}
+	parts = append(parts, lines[start+1:last]...)
+	parts = append(parts, lines[last][:end+1])
+	return bytes.Join(parts, []byte("\n"))
 }
 
 // closingQuote returns the index of the first unescaped quote in b, or -1.

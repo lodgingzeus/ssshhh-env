@@ -15,7 +15,9 @@ import (
 
 	"github.com/lodgingzeus/ssshhh-env/internal/audit"
 	"github.com/lodgingzeus/ssshhh-env/internal/auth"
+	"github.com/lodgingzeus/ssshhh-env/internal/commands"
 	"github.com/lodgingzeus/ssshhh-env/internal/crypto"
+	"github.com/lodgingzeus/ssshhh-env/internal/github"
 	"github.com/lodgingzeus/ssshhh-env/internal/store"
 )
 
@@ -25,7 +27,10 @@ type Config struct {
 	HostSigner gossh.Signer
 	Store      *store.Store
 	MasterKey  *crypto.MasterKey // wraps the per-project data keys
-	Logger     *slog.Logger
+	// GitHub fetches keys for users added by GitHub username. Nil means
+	// github.com.
+	GitHub commands.KeyFetcher
+	Logger *slog.Logger
 
 	HandshakeTimeout time.Duration // until authentication completes
 	IdleTimeout      time.Duration // no traffic
@@ -91,6 +96,9 @@ func New(cfg Config) (*ssh.Server, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
+	if cfg.GitHub == nil {
+		cfg.GitHub = github.Client{}
+	}
 	log := cfg.Logger
 	lim := newConnLimiter(cfg.MaxConns, cfg.MaxConnsPerIP, cfg.ConnRate, cfg.ConnBurst, maxTrackedIPs)
 
@@ -149,7 +157,7 @@ func New(cfg Config) (*ssh.Server, error) {
 		RequestHandlers:   map[string]ssh.RequestHandler{},
 		SubsystemHandlers: map[string]ssh.SubsystemHandler{},
 
-		Handler: sessionHandler(cfg.Store, cfg.MasterKey, log),
+		Handler: sessionHandler(commands.Deps{Store: cfg.Store, MasterKey: cfg.MasterKey, GitHub: cfg.GitHub, Log: log}, cfg.Store),
 	}
 	return srv, nil
 }

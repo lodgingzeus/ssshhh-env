@@ -21,62 +21,6 @@ const (
 	unknownName = "unknown"
 )
 
-// command is one entry in the command table. Adding a command means adding
-// one entry: its name, arguments, help line, authz action and handler all
-// live here.
-type command struct {
-	name    string
-	args    string // argument synopsis for help and usage errors
-	summary string
-	action  authz.Action
-	// project marks a command whose first argument is a project[:env]
-	// target. Run resolves the target and checks the caller's role in that
-	// project before the handler is called.
-	project bool
-	run     func(ctx context.Context, d Deps, inv *invocation) Result
-}
-
-// usage returns the command with its argument synopsis.
-func (c command) usage() string {
-	if c.args == "" {
-		return c.name
-	}
-	return c.name + " " + c.args
-}
-
-// table lists every command, in help order. It is filled in init because
-// the help handler reads the table.
-var table []command
-
-func init() {
-	table = []command{
-		{name: helpName, summary: "show this help", action: authz.Help, run: runHelp},
-		{name: "whoami", summary: "show who you are authenticated as", action: authz.Whoami, run: runWhoami},
-		{name: "init", args: "<project>", summary: "create a project (server admins only)", action: authz.Init, run: runInit},
-		{name: "push", args: "<project[:env]> [-m message]", summary: "store the .env file on stdin as a new version", action: authz.Push, project: true, run: runPush},
-		{name: "pull", args: "<project[:env]> [--version N]", summary: "print the latest .env file, or version N", action: authz.Pull, project: true, run: runPull},
-	}
-}
-
-func lookup(name string) (command, bool) {
-	for _, c := range table {
-		if c.name == name {
-			return c, true
-		}
-	}
-	return command{}, false
-}
-
-func helpText() string {
-	var b strings.Builder
-	b.WriteString("ssshhh-env: share .env files over ssh\n\nusage: ssh <host> <command> [args]\n\ncommands:\n")
-	for _, c := range table {
-		fmt.Fprintf(&b, "  %-37s %s\n", c.usage(), c.summary)
-	}
-	b.WriteString("\nexamples:\n  ssh <host> push myapp < .env\n  ssh <host> pull myapp:prod > .env.prod\n")
-	return b.String()
-}
-
 // Split splits a command line into words at whitespace. Quotes and
 // backslashes are ordinary characters: no command needs an argument with
 // spaces in it except push -m, which takes its message from the raw line
@@ -100,13 +44,14 @@ func afterWords(line string, n int) string {
 	return strings.TrimSpace(rest)
 }
 
-// Name returns the command name safe to log: a known command, "help" for an
-// empty command line, or "unknown". It never returns raw client input.
+// Name returns the command name safe to log: a known command such as
+// "push" or "user add", "help" for an empty command line, or "unknown". It
+// never returns raw client input.
 func Name(args []string) string {
 	if len(args) == 0 {
 		return helpName
 	}
-	if c, ok := lookup(args[0]); ok {
+	if c, ok := lookup(args); ok {
 		return c.name
 	}
 	return unknownName
@@ -119,13 +64,16 @@ func Name(args []string) string {
 // sent, so that nothing reaches the client before the action is audited.
 func Run(ctx context.Context, d Deps, req Request) Result {
 	args := Split(req.Line)
-	c, ok := lookup(Name(args))
+	if len(args) == 0 {
+		args = []string{helpName}
+	}
+	c, ok := lookup(args)
 	if !ok {
 		fmt.Fprint(req.Stderr, "unknown command\n\n"+helpText())
 		return Result{Code: 1, Outcome: audit.Error}
 	}
 	var out bytes.Buffer
-	inv := &invocation{Request: req, Args: args, Stdout: &out, cmd: c}
+	inv := &invocation{Request: req, Args: args, Params: args[c.words():], Stdout: &out, cmd: c}
 	res := run(ctx, d, inv)
 	res.Stdout = out.Bytes()
 	return res
@@ -136,7 +84,7 @@ func run(ctx context.Context, d Deps, inv *invocation) Result {
 	c, req := inv.cmd, inv.Request
 	sub := authz.Subject{IsAdmin: req.ID.IsAdmin}
 
-	if !c.project {
+	if c.scope == scopeNone {
 		if !authz.Can(sub, c.action, authz.RoleNone) {
 			fmt.Fprintln(req.Stderr, "permission denied")
 			return Result{Code: 1, Outcome: audit.Denied}
@@ -144,15 +92,28 @@ func run(ctx context.Context, d Deps, inv *invocation) Result {
 		return c.run(ctx, d, inv)
 	}
 
-	if len(inv.Args) < 2 {
+	if len(inv.Params) < 1 {
 		return inv.usageError()
 	}
-	target, err := ParseTarget(inv.Args[1])
-	if err != nil {
-		return inv.refuse("invalid target", err.Error())
+	if c.scope == scopeProject {
+		// A bare project name: membership is per project, not per
+		// environment, so "app:prod" is refused rather than read as "app".
+		project, _, hasEnv := strings.Cut(inv.Params[0], ":")
+		if hasEnv && ValidName(project) {
+			return inv.refuse("environment given", fmt.Sprintf("access is per project: give %s, not an environment", project))
+		}
+		if !ValidName(inv.Params[0]) {
+			return inv.refuse("invalid project name", errBadTarget.Error())
+		}
+		inv.target = Target{Project: inv.Params[0]}
+	} else {
+		target, err := ParseTarget(inv.Params[0])
+		if err != nil {
+			return inv.refuse("invalid target", err.Error())
+		}
+		inv.target = target
 	}
-	inv.target = target
-	project, role, err := resolveProject(ctx, d.Store, target.Project, req.ID.UserID)
+	project, role, err := resolveProject(ctx, d.Store, inv.target.Project, req.ID.UserID)
 	if err != nil {
 		return inv.internal(d, "resolve project", err)
 	}
@@ -161,7 +122,7 @@ func run(ctx context.Context, d Deps, inv *invocation) Result {
 	}
 	inv.project = project
 	res := c.run(ctx, d, inv)
-	res.Target = target.String()
+	res.Target = inv.auditTarget()
 	return res
 }
 

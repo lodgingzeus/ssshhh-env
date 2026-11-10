@@ -49,8 +49,12 @@ func (inv *invocation) internal(d Deps, what string, err error) Result {
 	return Result{Code: 1, Outcome: audit.Error, Target: inv.auditTarget(), Detail: "internal error: " + what}
 }
 
-// auditTarget is the validated target, or "" before one has been parsed.
+// auditTarget is the validated target or user, or "" before one has been
+// parsed.
 func (inv *invocation) auditTarget() string {
+	if inv.user != "" {
+		return "user:" + inv.user
+	}
 	if inv.target == (Target{}) {
 		return ""
 	}

@@ -81,11 +81,7 @@ func runPush(ctx context.Context, d Deps, inv *invocation) Result {
 	if err != nil {
 		return inv.internal(d, "store version", err)
 	}
-	noun := "variables"
-	if len(names) == 1 {
-		noun = "variable"
-	}
-	fmt.Fprintf(inv.Stdout, "pushed %s version %d (%d %s)\n", inv.target, v.Number, len(names), noun)
+	fmt.Fprintf(inv.Stdout, "pushed %s version %d (%s)\n", inv.target, v.Number, plural(len(names), "variable"))
 	res := inv.ok(fmt.Sprintf("version %d", v.Number))
 	res.Changed = true
 	return res

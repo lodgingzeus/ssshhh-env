@@ -8,14 +8,13 @@ import (
 	"github.com/lodgingzeus/ssshhh-env/internal/audit"
 	"github.com/lodgingzeus/ssshhh-env/internal/auth"
 	"github.com/lodgingzeus/ssshhh-env/internal/commands"
-	"github.com/lodgingzeus/ssshhh-env/internal/crypto"
 	"github.com/lodgingzeus/ssshhh-env/internal/store"
 )
 
 // sessionHandler serves one session: identify the user, run one command,
 // audit it, exit.
-func sessionHandler(st *store.Store, mk *crypto.MasterKey, log *slog.Logger) ssh.Handler {
-	deps := commands.Deps{Store: st, MasterKey: mk, Log: log}
+func sessionHandler(deps commands.Deps, st *store.Store) ssh.Handler {
+	log := deps.Log
 	return func(s ssh.Session) {
 		ip := remoteIP(s.RemoteAddr())
 		id, ok := identify(s, st, log, ip)

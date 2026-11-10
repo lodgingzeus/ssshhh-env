@@ -27,8 +27,12 @@ const (
 
 var loginRe = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$`)
 
-// ErrNoKeys means the account exists but has no SSH keys.
-var ErrNoKeys = errors.New("github user has no SSH keys")
+var (
+	// ErrNoKeys means the account exists but has no SSH keys.
+	ErrNoKeys = errors.New("github user has no SSH keys")
+	// ErrUserNotFound means GitHub has no account with that name.
+	ErrUserNotFound = errors.New("github user not found")
+)
 
 // ValidLogin reports whether login is a syntactically valid GitHub username.
 func ValidLogin(login string) bool { return loginRe.MatchString(login) }
@@ -76,7 +80,7 @@ func (c Client) Keys(ctx context.Context, login string) ([]gossh.PublicKey, erro
 
 	switch {
 	case resp.StatusCode == http.StatusNotFound:
-		return nil, fmt.Errorf("github: user %s not found", login)
+		return nil, fmt.Errorf("%w: %s", ErrUserNotFound, login)
 	case resp.StatusCode != http.StatusOK:
 		return nil, fmt.Errorf("github: fetch keys for %s: unexpected status %d", login, resp.StatusCode)
 	}
