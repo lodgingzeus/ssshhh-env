@@ -6,9 +6,8 @@ package audit
 import (
 	"context"
 	"fmt"
-	"strings"
-	"unicode"
 
+	"github.com/lodgingzeus/ssshhh-env/internal/sanitize"
 	"github.com/lodgingzeus/ssshhh-env/internal/store"
 )
 
@@ -60,31 +59,11 @@ func Log(ctx context.Context, sink Sink, e Event) error {
 	}
 	return sink.InsertAudit(ctx, store.AuditRow{
 		UserID:         e.UserID,
-		KeyFingerprint: Clean(e.KeyFingerprint, maxTarget),
-		RemoteAddr:     Clean(e.RemoteAddr, maxAddr),
-		Action:         Clean(e.Action, maxAction),
-		Target:         Clean(e.Target, maxTarget),
+		KeyFingerprint: sanitize.Text(e.KeyFingerprint, maxTarget),
+		RemoteAddr:     sanitize.Text(e.RemoteAddr, maxAddr),
+		Action:         sanitize.Text(e.Action, maxAction),
+		Target:         sanitize.Text(e.Target, maxTarget),
 		Result:         string(e.Result),
-		Detail:         Clean(e.Detail, maxDetail),
+		Detail:         sanitize.Text(e.Detail, maxDetail),
 	})
-}
-
-// Clean makes s safe to store and display: invalid UTF-8 and control
-// characters (including newlines and terminal escapes) are removed, and the
-// result is cut to at most max runes.
-func Clean(s string, max int) string {
-	s = strings.ToValidUTF8(s, "")
-	var b strings.Builder
-	n := 0
-	for _, r := range s {
-		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
-			continue
-		}
-		if n == max {
-			break
-		}
-		b.WriteRune(r)
-		n++
-	}
-	return b.String()
 }

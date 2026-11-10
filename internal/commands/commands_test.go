@@ -2,11 +2,13 @@ package commands
 
 import (
 	"bytes"
+	"io"
 	"strings"
 	"testing"
 
 	"github.com/lodgingzeus/ssshhh-env/internal/audit"
 	"github.com/lodgingzeus/ssshhh-env/internal/auth"
+	"github.com/lodgingzeus/ssshhh-env/internal/authz"
 )
 
 func TestName(t *testing.T) {
@@ -66,17 +68,54 @@ func TestRun(t *testing.T) {
 	}
 }
 
-// Every name that Name can return for a known command must map to an
-// action, or the command would be refused for everyone.
-func TestEveryCommandHasAnAction(t *testing.T) {
-	for _, cmd := range []string{"help", "whoami"} {
-		if _, ok := actions[cmd]; !ok {
-			t.Errorf("command %q has no authz action", cmd)
+// Every table entry must be complete, uniquely named and tied to an action
+// the policy knows, or the command would be refused for everyone.
+func TestCommandTable(t *testing.T) {
+	seen := map[string]bool{}
+	everything := authz.Subject{IsAdmin: true}
+	for _, c := range table {
+		if c.name == "" || c.summary == "" || c.run == nil {
+			t.Errorf("incomplete command %+v", c)
+		}
+		if seen[c.name] || c.name == unknownName {
+			t.Errorf("command name %q is duplicated or reserved", c.name)
+		}
+		seen[c.name] = true
+		if !authz.Can(everything, c.action, authz.RoleOwner) {
+			t.Errorf("command %q: action %q is not in the authz policy", c.name, c.action)
+		}
+		if Name([]string{c.name}) != c.name {
+			t.Errorf("Name does not recognise %q", c.name)
+		}
+		if !strings.Contains(helpText(), c.name) {
+			t.Errorf("help does not list %q", c.name)
 		}
 	}
-	for cmd := range actions {
-		if Name([]string{cmd}) != cmd {
-			t.Errorf("action registered for %q, which Name does not recognise", cmd)
-		}
+	if !seen[helpName] {
+		t.Error("no help command")
+	}
+}
+
+// A command whose action the user may not perform is refused and never run.
+func TestRunDeniesWithoutPermission(t *testing.T) {
+	ran := false
+	saved := table
+	defer func() { table = saved }()
+	table = append(append([]command{}, saved...), command{
+		name: "adminonly", summary: "test", action: authz.ManageUsers,
+		run: func([]string, auth.Identity, io.Writer, io.Writer) (int, audit.Result) {
+			ran = true
+			return 0, audit.OK
+		},
+	})
+
+	var out, errb bytes.Buffer
+	code, result := Run([]string{"adminonly"}, auth.Identity{Name: "bob"}, &out, &errb)
+	if code != 1 || result != audit.Denied || ran || !strings.Contains(errb.String(), "permission denied") {
+		t.Fatalf("non-admin: code %d, result %q, ran %v, stderr %q", code, result, ran, errb.String())
+	}
+	code, result = Run([]string{"adminonly"}, auth.Identity{Name: "alice", IsAdmin: true}, &out, &errb)
+	if code != 0 || result != audit.OK || !ran {
+		t.Fatalf("admin: code %d, result %q, ran %v", code, result, ran)
 	}
 }
