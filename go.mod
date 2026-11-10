@@ -4,7 +4,7 @@ go 1.26.8
 
 require (
 	charm.land/ssh v0.4.3
-	golang.org/x/crypto v0.57.0
+	golang.org/x/crypto v0.58.0
 	golang.org/x/time v0.16.0
 	modernc.org/sqlite v1.62.0
 )
