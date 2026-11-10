@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"strings"
 	"unicode/utf8"
 
 	"github.com/lodgingzeus/ssshhh-env/internal/crypto"
@@ -16,24 +15,30 @@ import (
 // maxMessageLen is the longest -m message, in characters.
 const maxMessageLen = 200
 
-// parsePushArgs parses what follows the target: nothing, or "-m" and a
-// message. ssh joins its arguments with spaces before sending them, so an
-// unquoted multi-word message arrives as several arguments; everything
-// after -m is the message.
-func parsePushArgs(rest []string) (message string, ok bool) {
+// parsePushArgs parses what follows the target on a push command line:
+// nothing, or "-m" and a message. The message is the rest of the line as
+// the client sent it, trimmed: ssh joins its arguments with spaces, so an
+// unquoted multi-word message arrives as several words, and any quotes,
+// apostrophes or backslashes in it are part of the message.
+func parsePushArgs(line string) (message string, ok bool) {
+	words := Split(line)
+	if len(words) < 2 {
+		return "", false
+	}
+	rest := words[2:]
 	if len(rest) == 0 {
 		return "", true
 	}
 	if rest[0] != "-m" || len(rest) < 2 {
 		return "", false
 	}
-	return strings.Join(rest[1:], " "), true
+	return afterWords(line, 3), true
 }
 
 // runPush stores the .env file on stdin as the environment's next version.
 // The file is validated, then encrypted before it reaches the store.
 func runPush(ctx context.Context, d Deps, inv *invocation) Result {
-	message, ok := parsePushArgs(inv.Args[2:])
+	message, ok := parsePushArgs(inv.Line)
 	if !ok {
 		return inv.usageError()
 	}
@@ -81,5 +86,7 @@ func runPush(ctx context.Context, d Deps, inv *invocation) Result {
 		noun = "variable"
 	}
 	fmt.Fprintf(inv.Stdout, "pushed %s version %d (%d %s)\n", inv.target, v.Number, len(names), noun)
-	return inv.ok(fmt.Sprintf("version %d", v.Number))
+	res := inv.ok(fmt.Sprintf("version %d", v.Number))
+	res.Changed = true
+	return res
 }

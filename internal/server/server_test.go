@@ -275,7 +275,7 @@ func TestOnlyPublicKeyAuth(t *testing.T) {
 func TestUnknownCommandExitsOne(t *testing.T) {
 	ts := startServer(t, nil)
 	c := ts.dialAlice(t)
-	for _, cmd := range []string{"rm -rf /", "bash", `"unterminated`} {
+	for _, cmd := range []string{"rm -rf /", "bash", `"unterminated`, `whoami'`, `"whoami`} {
 		_, stderr, code := runCmd(t, c, cmd)
 		if code != 1 {
 			t.Errorf("%q: exit = %d, want 1", cmd, code)

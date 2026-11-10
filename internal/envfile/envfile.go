@@ -25,7 +25,11 @@ var (
 	ErrNotUTF8  = errors.New("file is not valid UTF-8 text")
 	ErrNUL      = errors.New("file contains a NUL byte")
 	ErrEmpty    = errors.New("file has no variables")
+	ErrBOM      = errors.New("file starts with a UTF-8 byte order mark (BOM); save it as UTF-8 without BOM")
 )
+
+// bom is the UTF-8 byte order mark some editors put at the start of a file.
+var bom = []byte("\xEF\xBB\xBF")
 
 // SyntaxError reports a line that is not a comment, blank or KEY=VALUE.
 type SyntaxError struct {
@@ -48,6 +52,10 @@ func Parse(data []byte) ([]string, error) {
 		return nil, ErrNUL
 	case !utf8.Valid(data):
 		return nil, ErrNotUTF8
+	case bytes.HasPrefix(data, bom):
+		// Refused, not stripped: bytes are stored verbatim, and a BOM
+		// pulled into another tool would corrupt the first variable name.
+		return nil, ErrBOM
 	}
 
 	lines := bytes.Split(data, []byte("\n"))

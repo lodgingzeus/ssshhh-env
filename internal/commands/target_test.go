@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
@@ -42,24 +43,57 @@ func TestTargetString(t *testing.T) {
 
 func TestParsePushArgs(t *testing.T) {
 	tests := []struct {
-		rest []string
+		line string
 		msg  string
 		ok   bool
 	}{
-		{nil, "", true},
-		{[]string{"-m", "fix"}, "fix", true},
-		{[]string{"-m", "rotate", "db", "password"}, "rotate db password", true},
-		{[]string{"-m", "-m"}, "-m", true},
-		{[]string{"-m"}, "", false},
-		{[]string{"fix"}, "", false},
-		{[]string{"--message", "fix"}, "", false},
-		{[]string{"-mfix"}, "", false},
-		{[]string{"extra", "-m", "fix"}, "", false},
+		{"push app", "", true},
+		{"push app -m fix", "fix", true},
+		{"push app -m rotate db password", "rotate db password", true},
+		{"push app -m -m", "-m", true},
+		{"push app -m", "", false},
+		{"push app -m   ", "", false},
+		{"push app fix", "", false},
+		{"push app --message fix", "", false},
+		{"push app -mfix", "", false},
+		{"push app extra -m fix", "", false},
+		{"push", "", false},
+		// The message is the raw rest of the line: nothing in it is
+		// interpreted, and inner spacing is kept.
+		{"push app -m it's fixed", "it's fixed", true},
+		{`push app -m don't "quote`, `don't "quote`, true},
+		{`push app -m C:\path\to`, `C:\path\to`, true},
+		{"push app -m two  spaces", "two  spaces", true},
+		{"push app -m rotate $KEY", "rotate $KEY", true},
+		{"  push\tapp \t-m\t  tabs\tand spaces  \n", "tabs\tand spaces", true},
+		{"push app -m 'quoted'", "'quoted'", true},
 	}
 	for _, tt := range tests {
-		msg, ok := parsePushArgs(tt.rest)
+		msg, ok := parsePushArgs(tt.line)
 		if msg != tt.msg || ok != tt.ok {
-			t.Errorf("parsePushArgs(%q) = %q, %v; want %q, %v", tt.rest, msg, ok, tt.msg, tt.ok)
+			t.Errorf("parsePushArgs(%q) = %q, %v; want %q, %v", tt.line, msg, ok, tt.msg, tt.ok)
+		}
+	}
+}
+
+func TestSplit(t *testing.T) {
+	tests := []struct {
+		line string
+		want []string
+	}{
+		{"", nil},
+		{"   ", nil},
+		{"whoami", []string{"whoami"}},
+		{" pull  app:prod\t--version 2\n", []string{"pull", "app:prod", "--version", "2"}},
+		// Quotes and backslashes are ordinary characters, so a line with
+		// an unclosed quote is not half-parsed.
+		{`pull "app`, []string{"pull", `"app`}},
+		{`whoami'`, []string{"whoami'"}},
+		{`pull a\ b`, []string{"pull", `a\`, "b"}},
+	}
+	for _, tt := range tests {
+		if got := Split(tt.line); !slices.Equal(got, tt.want) {
+			t.Errorf("Split(%q) = %q, want %q", tt.line, got, tt.want)
 		}
 	}
 }
@@ -122,16 +156,40 @@ func FuzzParseTarget(f *testing.F) {
 // The argument parsers take raw client input: they must never panic, and
 // what they accept must be well-formed.
 func FuzzParseArgs(f *testing.F) {
-	for _, seed := range []string{"", "-m fix", "-m", "--version 3", "--version", "--version -1", "x y z"} {
+	for _, seed := range []string{"", "-m fix", "-m", "--version 3", "--version", "--version -1", "x y z", "-m it's", "-m \t a\u00a0b \n", "-m \xff"} {
 		f.Add(seed)
 	}
-	f.Fuzz(func(t *testing.T, line string) {
-		rest := strings.Fields(line)
-		if msg, ok := parsePushArgs(rest); ok && len(rest) > 0 && (rest[0] != "-m" || msg == "") {
-			t.Fatalf("parsePushArgs(%q) accepted with message %q", rest, msg)
+	f.Fuzz(func(t *testing.T, tail string) {
+		line := "push app " + tail
+		rest := Split(tail)
+		if msg, ok := parsePushArgs(line); ok && len(rest) > 0 && (rest[0] != "-m" || msg == "") {
+			t.Fatalf("parsePushArgs(%q) accepted with message %q", line, msg)
 		}
 		if v, ok := parsePullArgs(rest); ok && (v < 0 || (len(rest) > 0 && v == 0)) {
 			t.Fatalf("parsePullArgs(%q) accepted version %d", rest, v)
+		}
+	})
+}
+
+// afterWords must agree with Split on where words end, or push -m would
+// take part of a word as its message, or a word from before -m.
+func FuzzAfterWords(f *testing.F) {
+	for _, seed := range []string{"", "a", "a b c", "  a\tb\n c ", "a\u00a0b c", "\xff \x85x", "\u2003a\u3000b"} {
+		f.Add(seed, uint8(1))
+	}
+	f.Fuzz(func(t *testing.T, line string, k uint8) {
+		n := int(k % 8)
+		words := Split(line)
+		var want []string
+		if n < len(words) {
+			want = words[n:]
+		}
+		got := afterWords(line, n)
+		if !slices.Equal(Split(got), want) {
+			t.Fatalf("Split(afterWords(%q, %d)) = %q, want %q", line, n, Split(got), want)
+		}
+		if got != strings.TrimSpace(got) {
+			t.Fatalf("afterWords(%q, %d) = %q is not trimmed", line, n, got)
 		}
 	})
 }

@@ -3,10 +3,12 @@
 package commands
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"strings"
+	"unicode"
 
 	"github.com/lodgingzeus/ssshhh-env/internal/audit"
 	"github.com/lodgingzeus/ssshhh-env/internal/authz"
@@ -75,6 +77,29 @@ func helpText() string {
 	return b.String()
 }
 
+// Split splits a command line into words at whitespace. Quotes and
+// backslashes are ordinary characters: no command needs an argument with
+// spaces in it except push -m, which takes its message from the raw line
+// (see afterWords). Nothing is ever unparseable, so a line can't be
+// half-understood.
+func Split(line string) []string { return strings.Fields(line) }
+
+// afterWords returns line without its first n words, trimmed of
+// surrounding whitespace. Words are separated exactly as Split separates
+// them.
+func afterWords(line string, n int) string {
+	rest := line
+	for range n {
+		rest = strings.TrimLeftFunc(rest, unicode.IsSpace)
+		i := strings.IndexFunc(rest, unicode.IsSpace)
+		if i < 0 {
+			return ""
+		}
+		rest = rest[i:]
+	}
+	return strings.TrimSpace(rest)
+}
+
 // Name returns the command name safe to log: a known command, "help" for an
 // empty command line, or "unknown". It never returns raw client input.
 func Name(args []string) string {
@@ -89,13 +114,26 @@ func Name(args []string) string {
 
 // Run executes req. Authorization happens here, before any handler runs:
 // a handler can assume the caller may perform its command's action.
+//
+// What a handler writes to stdout is returned in Result.Stdout rather than
+// sent, so that nothing reaches the client before the action is audited.
 func Run(ctx context.Context, d Deps, req Request) Result {
-	c, ok := lookup(Name(req.Args))
+	args := Split(req.Line)
+	c, ok := lookup(Name(args))
 	if !ok {
 		fmt.Fprint(req.Stderr, "unknown command\n\n"+helpText())
 		return Result{Code: 1, Outcome: audit.Error}
 	}
-	inv := &invocation{Request: req, cmd: c}
+	var out bytes.Buffer
+	inv := &invocation{Request: req, Args: args, Stdout: &out, cmd: c}
+	res := run(ctx, d, inv)
+	res.Stdout = out.Bytes()
+	return res
+}
+
+// run checks authorization for inv and calls its handler.
+func run(ctx context.Context, d Deps, inv *invocation) Result {
+	c, req := inv.cmd, inv.Request
 	sub := authz.Subject{IsAdmin: req.ID.IsAdmin}
 
 	if !c.project {
@@ -106,10 +144,10 @@ func Run(ctx context.Context, d Deps, req Request) Result {
 		return c.run(ctx, d, inv)
 	}
 
-	if len(req.Args) < 2 {
+	if len(inv.Args) < 2 {
 		return inv.usageError()
 	}
-	target, err := ParseTarget(req.Args[1])
+	target, err := ParseTarget(inv.Args[1])
 	if err != nil {
 		return inv.refuse("invalid target", err.Error())
 	}

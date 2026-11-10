@@ -28,5 +28,7 @@ func runInit(ctx context.Context, d Deps, inv *invocation) Result {
 		return inv.internal(d, "create project", err)
 	}
 	fmt.Fprintf(inv.Stdout, "created project %s; you are its owner\nnext: ssh <host> push %s < .env\n", name, name)
-	return inv.ok("project created")
+	res := inv.ok("project created")
+	res.Changed = true
+	return res
 }

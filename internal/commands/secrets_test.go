@@ -154,7 +154,9 @@ func TestEnvironmentsAreSeparate(t *testing.T) {
 func TestPushStoresMetadataNotValues(t *testing.T) {
 	e := newTestEnv(t)
 	p := e.project(t, "app", nil)
-	e.push(t, "app", sampleEnv, "-m", "add\x1b[31m", "api", "key\n")
+	if res, _, stderr := e.runLine(e.root, sampleEnv, "push app -m add\x1b[31m api key\n"); res.Code != 0 {
+		t.Fatalf("push: %s", stderr)
+	}
 
 	v, err := e.st.LatestVersion(context.Background(), p.ID, DefaultEnv)
 	if err != nil {
@@ -467,5 +469,47 @@ func TestWrongMasterKey(t *testing.T) {
 	// Nothing was written under the wrong key.
 	if res, _, _ := e.run(e.root, "", "pull", "app"); string(res.Secret) != sampleEnv {
 		t.Fatalf("after a wrong-key push, pull = %+v", res)
+	}
+}
+
+// Output is handed back in Result.Stdout for the caller to send after the
+// audit row is written, and Changed marks the commands that saved
+// something.
+func TestOutputIsReturnedNotSent(t *testing.T) {
+	e := newTestEnv(t)
+	tests := []struct {
+		name    string
+		stdin   string
+		line    string
+		code    int
+		stdout  string
+		changed bool
+	}{
+		{"init", "", "init app", 0, "created project app", true},
+		{"init again", "", "init app", 1, "", false},
+		{"push", "A=1\n", "push app -m it's fixed", 0, "pushed app:default version 1", true},
+		{"invalid push", "nope\n", "push app", 1, "", false},
+		{"pull", "", "pull app", 0, "", false},
+		{"whoami", "", "whoami", 0, "user:        root", false},
+		{"unknown", "", "nope", 1, "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res, out, _ := e.runLine(e.root, tt.stdin, tt.line)
+			if res.Code != tt.code || res.Changed != tt.changed || !strings.Contains(out, tt.stdout) || (tt.stdout == "" && out != "") {
+				t.Fatalf("%q: code %d, changed %v, stdout %q", tt.line, res.Code, res.Changed, out)
+			}
+		})
+	}
+	p, err := e.st.ProjectByName(context.Background(), "app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := e.st.LatestVersion(context.Background(), p.ID, DefaultEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Message != "it's fixed" {
+		t.Errorf("message = %q, want it stored as typed", v.Message)
 	}
 }

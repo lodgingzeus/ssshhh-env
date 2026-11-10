@@ -3,9 +3,11 @@ package commands
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -58,9 +60,24 @@ func (e *testEnv) run(id auth.Identity, stdin string, args ...string) (Result, s
 }
 
 func (e *testEnv) runWith(d Deps, id auth.Identity, stdin io.Reader, args ...string) (Result, string, string) {
-	var out, errb bytes.Buffer
-	res := Run(context.Background(), d, Request{Args: args, ID: id, Stdin: stdin, Stdout: &out, Stderr: &errb})
-	return res, out.String(), errb.String()
+	line := strings.Join(args, " ")
+	// An argument with whitespace in it would be split differently from
+	// how it reads here; such tests must use runLine.
+	if !slices.Equal(Split(line), args) && len(args) > 0 {
+		panic(fmt.Sprintf("test arguments %q do not survive splitting; use runLine", args))
+	}
+	return e.runLineWith(d, id, stdin, line)
+}
+
+// runLine executes one raw command line, as a client would send it.
+func (e *testEnv) runLine(id auth.Identity, stdin, line string) (Result, string, string) {
+	return e.runLineWith(e.deps, id, strings.NewReader(stdin), line)
+}
+
+func (e *testEnv) runLineWith(d Deps, id auth.Identity, stdin io.Reader, line string) (Result, string, string) {
+	var errb bytes.Buffer
+	res := Run(context.Background(), d, Request{Line: line, ID: id, Stdin: stdin, Stderr: &errb})
+	return res, string(res.Stdout), errb.String()
 }
 
 // project creates a project owned by root and gives each listed user the

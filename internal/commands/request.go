@@ -30,10 +30,11 @@ type Deps struct {
 
 // Request is one command from an authenticated client.
 type Request struct {
-	Args   []string
+	// Line is the command line exactly as the client sent it. It may
+	// contain anything, including secrets typed by mistake: never log it.
+	Line   string
 	ID     auth.Identity
 	Stdin  io.Reader
-	Stdout io.Writer
 	Stderr io.Writer
 }
 
@@ -46,16 +47,25 @@ type Result struct {
 	Target string
 	// Detail is a short note for the audit log, in fixed wording.
 	Detail string
-	// Secret is decrypted file content for the client's stdout. Commands
-	// never write it themselves: the caller must write the audit row first
-	// and send Secret only if that succeeded, so no read goes unrecorded.
+	// Stdout is the command's output for the client's stdout, and Secret
+	// is decrypted file content for it. Commands never write either
+	// themselves: the caller must write the audit row first and send them
+	// only if that succeeded, so no action looks done and no read happens
+	// without a record.
+	Stdout []byte
 	Secret []byte
+	// Changed reports that the command saved a change (a project or a
+	// version). If the audit write then fails, the client must be told the
+	// change was made, or a retry would make it twice.
+	Changed bool
 }
 
 // invocation is a request after Run has resolved what it addresses.
 type invocation struct {
 	Request
-	cmd command
+	Args   []string  // Line split into words
+	Stdout io.Writer // collected into Result.Stdout
+	cmd    command
 	// Set for commands that address a project: the caller has already been
 	// authorised for cmd.action on it.
 	target  Target

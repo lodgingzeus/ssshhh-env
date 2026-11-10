@@ -24,12 +24,12 @@ func sessionHandler(st *store.Store, mk *crypto.MasterKey, log *slog.Logger) ssh
 			return
 		}
 
-		args := s.Command()
-		if len(args) == 0 && s.RawCommand() != "" {
-			args = []string{""} // unparseable command line: treat as unknown
-		}
-		name := commands.Name(args)
-		res := commands.Run(s.Context(), deps, commands.Request{Args: args, ID: id, Stdin: s, Stdout: s, Stderr: s.Stderr()})
+		// The raw line, not s.Command(): the library's shell-style split
+		// drops its error and returns the words it got so far, so a line
+		// with an unclosed quote would run half-parsed.
+		line := s.RawCommand()
+		name := commands.Name(commands.Split(line))
+		res := commands.Run(s.Context(), deps, commands.Request{Line: line, ID: id, Stdin: s, Stderr: s.Stderr()})
 		code := res.Code
 		// Record the command name and validated target only, never the raw
 		// command line: it may contain secrets typed by mistake.
@@ -44,18 +44,30 @@ func sessionHandler(st *store.Store, mk *crypto.MasterKey, log *slog.Logger) ssh
 			Result:         res.Outcome,
 			Detail:         res.Detail,
 		})
-		switch {
-		case !audited:
+		if !audited {
 			// An action that could not be audited must not look successful,
-			// and a secret that could not be audited is not sent at all.
+			// and a secret that could not be audited is not sent at all. A
+			// change that was already saved is reported as such, so the
+			// client doesn't make it again.
 			if code == 0 {
 				code = 1
 			}
-			_, _ = s.Stderr().Write([]byte("internal error\n"))
-		case len(res.Secret) > 0:
-			if _, err := s.Write(res.Secret); err != nil {
+			msg := "internal error\n"
+			if res.Changed {
+				msg = "internal error: the change was saved, but recording it in the audit log failed\n"
+			}
+			_, _ = s.Stderr().Write([]byte(msg))
+			_ = s.Exit(code)
+			return
+		}
+		for _, out := range [][]byte{res.Stdout, res.Secret} {
+			if len(out) == 0 {
+				continue
+			}
+			if _, err := s.Write(out); err != nil {
 				log.Warn("sending output failed", "cmd", name, "target", res.Target, "err", err)
 				code = 1
+				break
 			}
 		}
 		_ = s.Exit(code)

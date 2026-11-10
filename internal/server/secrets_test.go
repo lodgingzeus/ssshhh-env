@@ -209,6 +209,7 @@ func TestCanaryNeverLeaks(t *testing.T) {
 		{root, "push app", "9" + canary + "=1\n", false},
 		{root, "push app", "A=" + canary + "\x00\n", false},
 		{root, "push app", "A=" + canary + "\xff\n", false},
+		{root, "push app", "\xEF\xBB\xBF" + canary + "=1\n", false},
 		{root, "push app", "A=" + canary + strings.Repeat("x", envfile.MaxSize), false},
 		{alice, "push app", env, false},
 		{alice, "push ghost", env, false},
@@ -267,5 +268,81 @@ func TestCanaryNeverLeaks(t *testing.T) {
 	// scan above was looking at the data that was really written.
 	if !sawVarName {
 		t.Error("variable name not found in the database files; the plaintext scan is not checking the right data")
+	}
+}
+
+// The command line is split at whitespace only. A push message is kept as
+// typed, and a line with an unclosed quote is never run half-parsed.
+func TestCommandLineNotShellParsed(t *testing.T) {
+	ts := startServer(t, nil)
+	ts.initProject(t, "app", nil)
+	root := ts.dialRoot(t)
+	p, err := ts.st.ProjectByName(context.Background(), "app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, msg := range []string{"it's fixed", `don't "quote`, `C:\path\to`, "two  spaces", "rotate $KEY"} {
+		if _, stderr, code := runCmdInput(t, root, "push app -m "+msg, "A=1\n"); code != 0 {
+			t.Fatalf("push -m %q: exit %d, %s", msg, code, stderr)
+		}
+		v, err := ts.st.LatestVersion(context.Background(), p.ID, "default")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v.Message != msg {
+			t.Errorf("message = %q, want %q", v.Message, msg)
+		}
+	}
+	// The library's shell-style split would have run this as "pull app".
+	out, stderr, code := runCmd(t, root, "pull app'")
+	if code != 1 || out != "" || !strings.Contains(stderr, "invalid name") {
+		t.Fatalf("pull app': exit %d, stdout %q, stderr %q", code, out, stderr)
+	}
+}
+
+func TestPushWithByteOrderMarkRefused(t *testing.T) {
+	ts := startServer(t, nil)
+	ts.initProject(t, "app", nil)
+	root := ts.dialRoot(t)
+	_, stderr, code := runCmdInput(t, root, "push app", "\xEF\xBB\xBFA=1\n")
+	if code != 1 || !strings.Contains(stderr, "byte order mark") {
+		t.Fatalf("exit %d, stderr %q", code, stderr)
+	}
+}
+
+// Nothing reaches stdout before the audit row is written. A push whose
+// audit write fails was still saved, and the client is told so, so that
+// retrying doesn't store it twice.
+func TestAuditFailureAfterPush(t *testing.T) {
+	ts := startServer(t, nil)
+	ts.initProject(t, "app", nil)
+	root := ts.dialRoot(t)
+
+	db, err := sql.Open("sqlite", ts.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TRIGGER audit_down BEFORE INSERT ON audit_log BEGIN SELECT RAISE(ABORT, 'audit down'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	out, stderr, code := runCmdInput(t, root, "push app", "A=1\n")
+	if code != 1 || out != "" || !strings.Contains(stderr, "the change was saved") {
+		t.Fatalf("push: exit %d, stdout %q, stderr %q", code, out, stderr)
+	}
+	p, err := ts.st.ProjectByName(context.Background(), "app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, err := ts.st.LatestVersion(context.Background(), p.ID, "default"); err != nil || v.Number != 1 {
+		t.Fatalf("version after push: %+v, %v", v, err)
+	}
+
+	// A command that changed nothing gets a plain internal error and no
+	// output.
+	out, stderr, code = runCmd(t, root, "whoami")
+	if code != 1 || out != "" || strings.Contains(stderr, "saved") || !strings.Contains(stderr, "internal error") {
+		t.Fatalf("whoami: exit %d, stdout %q, stderr %q", code, out, stderr)
 	}
 }

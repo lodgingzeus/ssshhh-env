@@ -97,6 +97,8 @@ func TestParseRefusesWholeFile(t *testing.T) {
 		{"only comments", []byte("# nothing\n\n"), ErrEmpty},
 		{"nul", []byte("A=1\x00\n"), ErrNUL},
 		{"invalid utf-8", []byte("A=\xff\xfe\n"), ErrNotUTF8},
+		{"byte order mark", []byte("\xEF\xBB\xBFA=1\n"), ErrBOM},
+		{"byte order mark before a comment", []byte("\xEF\xBB\xBF# x\nA=1\n"), ErrBOM},
 		{"too large", append([]byte("A="), make([]byte, MaxSize)...), ErrTooLarge},
 	}
 	for _, tt := range tests {
