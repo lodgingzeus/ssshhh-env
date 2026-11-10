@@ -19,6 +19,7 @@ import (
 	"golang.org/x/time/rate"
 
 	"github.com/lodgingzeus/ssshhh-env/internal/auth"
+	"github.com/lodgingzeus/ssshhh-env/internal/crypto"
 	"github.com/lodgingzeus/ssshhh-env/internal/store"
 )
 
@@ -44,8 +45,10 @@ type testServer struct {
 	addr    string
 	hostKey gossh.PublicKey
 	alice   gossh.Signer // registered as "alice", not an admin
+	root    gossh.Signer // registered as "root", a server admin
 	users   map[string]store.User
 	st      *store.Store
+	dbPath  string
 	logs    *syncBuffer
 }
 
@@ -97,7 +100,8 @@ func startServer(t *testing.T, modify func(*Config)) *testServer {
 	return startServerWithKeys(t, nil, modify)
 }
 
-// startServerWithKeys registers a generated "alice" plus extra users by name.
+// startServerWithKeys registers a generated "alice" and "root" (the only
+// admin) plus extra users by name.
 func startServerWithKeys(t *testing.T, extra map[string]gossh.PublicKey, modify func(*Config)) *testServer {
 	t.Helper()
 	dir := t.TempDir()
@@ -106,12 +110,13 @@ func startServerWithKeys(t *testing.T, extra map[string]gossh.PublicKey, modify 
 	if err != nil {
 		t.Fatal(err)
 	}
-	alice := newSigner(t)
-	keys := map[string]gossh.PublicKey{"alice": alice.PublicKey()}
+	alice, root := newSigner(t), newSigner(t)
+	keys := map[string]gossh.PublicKey{"alice": alice.PublicKey(), "root": root.PublicKey()}
 	for name, k := range extra {
 		keys[name] = k
 	}
-	st, err := store.Open(context.Background(), filepath.Join(dir, "test.db"))
+	dbPath := filepath.Join(dir, "test.db")
+	st, err := store.Open(context.Background(), dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,11 +127,16 @@ func startServerWithKeys(t *testing.T, extra map[string]gossh.PublicKey, modify 
 		if err != nil {
 			t.Fatal(err)
 		}
-		u, err := st.CreateUser(context.Background(), store.NewUser{Name: name}, []store.NewKey{nk})
+		u, err := st.CreateUser(context.Background(), store.NewUser{Name: name, IsAdmin: name == "root"}, []store.NewKey{nk})
 		if err != nil {
 			t.Fatal(err)
 		}
 		users[name] = u
+	}
+
+	masterKey, err := crypto.GenerateMasterKey()
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	logs := &syncBuffer{}
@@ -134,6 +144,7 @@ func startServerWithKeys(t *testing.T, extra map[string]gossh.PublicKey, modify 
 	cfg.Addr = ""
 	cfg.HostSigner = host
 	cfg.Store = st
+	cfg.MasterKey = masterKey
 	cfg.Logger = slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	cfg.ConnRate = rate.Inf
 	if modify != nil {
@@ -150,7 +161,7 @@ func startServerWithKeys(t *testing.T, extra map[string]gossh.PublicKey, modify 
 	go func() { _ = srv.Serve(ln) }()
 	t.Cleanup(func() { _ = srv.Close() })
 
-	return &testServer{addr: ln.Addr().String(), hostKey: host.PublicKey(), alice: alice, users: users, st: st, logs: logs}
+	return &testServer{addr: ln.Addr().String(), hostKey: host.PublicKey(), alice: alice, root: root, users: users, st: st, dbPath: dbPath, logs: logs}
 }
 
 func (ts *testServer) dial(auths ...gossh.AuthMethod) (*gossh.Client, error) {
@@ -172,6 +183,16 @@ func (ts *testServer) dialAlice(t *testing.T) *gossh.Client {
 	return c
 }
 
+func (ts *testServer) dialRoot(t *testing.T) *gossh.Client {
+	t.Helper()
+	c, err := ts.dial(gossh.PublicKeys(ts.root))
+	if err != nil {
+		t.Fatalf("dial as root: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	return c
+}
+
 func newSession(t *testing.T, c *gossh.Client) *gossh.Session {
 	t.Helper()
 	s, err := c.NewSession()
@@ -185,9 +206,15 @@ func newSession(t *testing.T, c *gossh.Client) *gossh.Session {
 // runCmd runs cmd and returns stdout, stderr and the exit status.
 func runCmd(t *testing.T, c *gossh.Client, cmd string) (string, string, int) {
 	t.Helper()
+	return runCmdInput(t, c, cmd, "")
+}
+
+// runCmdInput is runCmd with stdin.
+func runCmdInput(t *testing.T, c *gossh.Client, cmd, stdin string) (string, string, int) {
+	t.Helper()
 	s := newSession(t, c)
 	var out, errb bytes.Buffer
-	s.Stdout, s.Stderr = &out, &errb
+	s.Stdin, s.Stdout, s.Stderr = strings.NewReader(stdin), &out, &errb
 	err := s.Run(cmd)
 	var exitErr *gossh.ExitError
 	switch {
@@ -484,9 +511,27 @@ func TestBadSignatureEndsConnection(t *testing.T) {
 	}
 }
 
-func TestNewRequiresHostKeyAndStore(t *testing.T) {
-	if _, err := New(DefaultConfig()); err == nil {
-		t.Fatal("New without host key or store succeeded")
+func TestNewRequiresHostKeyStoreAndMasterKey(t *testing.T) {
+	ts := startServer(t, nil)
+	full := DefaultConfig()
+	full.HostSigner, full.Store = newSigner(t), ts.st
+	var err error
+	if full.MasterKey, err = crypto.GenerateMasterKey(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(full); err != nil {
+		t.Fatalf("complete config refused: %v", err)
+	}
+	for name, strip := range map[string]func(*Config){
+		"host key":   func(c *Config) { c.HostSigner = nil },
+		"store":      func(c *Config) { c.Store = nil },
+		"master key": func(c *Config) { c.MasterKey = nil },
+	} {
+		cfg := full
+		strip(&cfg)
+		if _, err := New(cfg); err == nil {
+			t.Errorf("New without a %s succeeded", name)
+		}
 	}
 }
 

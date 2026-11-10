@@ -15,7 +15,7 @@ import (
 
 	"github.com/lodgingzeus/ssshhh-env/internal/audit"
 	"github.com/lodgingzeus/ssshhh-env/internal/auth"
-	"github.com/lodgingzeus/ssshhh-env/internal/commands"
+	"github.com/lodgingzeus/ssshhh-env/internal/crypto"
 	"github.com/lodgingzeus/ssshhh-env/internal/store"
 )
 
@@ -24,6 +24,7 @@ type Config struct {
 	Addr       string
 	HostSigner gossh.Signer
 	Store      *store.Store
+	MasterKey  *crypto.MasterKey // wraps the per-project data keys
 	Logger     *slog.Logger
 
 	HandshakeTimeout time.Duration // until authentication completes
@@ -74,14 +75,18 @@ var deniedSessionRequests = map[string]bool{
 type sessionCountKey struct{}
 
 // New builds the SSH server. Only public-key auth against the keys
-// registered in the store is accepted, and only "session" channels running allowlisted commands are
-// served: no shell, PTY, subsystems or forwarding of any kind.
+// registered in the store is accepted, and only "session" channels running
+// allowlisted commands are served: no shell, PTY, subsystems or forwarding
+// of any kind.
 func New(cfg Config) (*ssh.Server, error) {
 	if cfg.HostSigner == nil {
 		return nil, errors.New("server: host key required")
 	}
 	if cfg.Store == nil {
 		return nil, errors.New("server: store required")
+	}
+	if cfg.MasterKey == nil {
+		return nil, errors.New("server: master key required")
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -144,7 +149,7 @@ func New(cfg Config) (*ssh.Server, error) {
 		RequestHandlers:   map[string]ssh.RequestHandler{},
 		SubsystemHandlers: map[string]ssh.SubsystemHandler{},
 
-		Handler: sessionHandler(cfg.Store, log),
+		Handler: sessionHandler(cfg.Store, cfg.MasterKey, log),
 	}
 	return srv, nil
 }
@@ -164,56 +169,6 @@ func writeAudit(st *store.Store, log *slog.Logger, e audit.Event) bool {
 		return false
 	}
 	return true
-}
-
-func sessionHandler(st *store.Store, log *slog.Logger) ssh.Handler {
-	return func(s ssh.Session) {
-		ip := remoteIP(s.RemoteAddr())
-		// s.PublicKey() is the key whose signature was verified. Looking it
-		// up again here, per session, means a user disabled or a key
-		// removed after the connection was made is refused straight away.
-		id, err := auth.Lookup(s.Context(), st, s.PublicKey())
-		if err != nil {
-			fp := ""
-			if pub := s.PublicKey(); pub != nil {
-				fp = auth.Fingerprint(pub)
-			}
-			if isAuthRefusal(err) {
-				log.Warn("session refused", "remote", ip, "fingerprint", fp, "reason", err)
-				writeAudit(st, log, audit.Event{KeyFingerprint: fp, RemoteAddr: ip, Action: "session", Result: audit.Denied, Detail: err.Error()})
-			} else {
-				log.Error("key lookup failed", "remote", ip, "err", err)
-				writeAudit(st, log, audit.Event{KeyFingerprint: fp, RemoteAddr: ip, Action: "session", Result: audit.Error, Detail: "key lookup failed"})
-			}
-			_ = s.Exit(1)
-			return
-		}
-		if err := st.TouchKey(s.Context(), id.KeyID); err != nil {
-			log.Error("update last_used_at failed", "err", err)
-		}
-
-		args := s.Command()
-		if len(args) == 0 && s.RawCommand() != "" {
-			args = []string{""} // unparseable command line: treat as unknown
-		}
-		name := commands.Name(args)
-		code, result := commands.Run(args, id, s, s.Stderr())
-		// Record the command name only, never the raw command line: it may
-		// contain secrets typed by mistake.
-		log.Info("session", "user", id.Name, "fingerprint", id.Fingerprint, "remote", ip, "cmd", name, "result", string(result), "exit", code)
-		ok := writeAudit(st, log, audit.Event{
-			UserID:         id.UserID,
-			KeyFingerprint: id.Fingerprint,
-			RemoteAddr:     ip,
-			Action:         name,
-			Result:         result,
-		})
-		if !ok && code == 0 {
-			// An action that could not be audited must not look successful.
-			code = 1
-		}
-		_ = s.Exit(code)
-	}
 }
 
 func sessionChannelHandler(maxSessions int, log *slog.Logger) ssh.ChannelHandler {

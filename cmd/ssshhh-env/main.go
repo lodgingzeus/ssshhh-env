@@ -26,7 +26,7 @@ const usage = `usage: ssshhh-env <command> [flags]
 commands:
   serve           run the SSH server
   admin           server-side account management (run on the host)
-  keygen-master   generate a 32-byte master key
+  keygen-master   generate the master key that encrypts the database
 `
 
 func main() {
@@ -55,8 +55,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		return 0
 	case "keygen-master":
-		fmt.Fprintf(stderr, "ssshhh-env: %s: not implemented yet\n", args[0])
-		return 1
+		if err := keygenMaster(args[1:], stdout, stderr); err != nil {
+			fmt.Fprintf(stderr, "ssshhh-env: %v\n", err)
+			return 1
+		}
+		return 0
 	default:
 		fmt.Fprintf(stderr, "ssshhh-env: unknown command %q\n\n%s", args[0], usage)
 		return 2
@@ -88,11 +91,18 @@ func serve(args []string, stderr io.Writer) error {
 	fs.SetOutput(stderr)
 	addr := fs.String("addr", ":2222", "address to listen on")
 	dataDir := fs.String("data-dir", "data", "directory for the database and host key (mode 0700)")
+	keyFile := fs.String("master-key-file", "", "master key file (mode 0600); or set "+masterKeyEnv)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() > 0 {
 		return fmt.Errorf("serve: unexpected argument %q", fs.Arg(0))
+	}
+	// Loaded first: without it nothing can be served, and a refused start
+	// should leave nothing behind.
+	masterKey, err := loadMasterKey(*keyFile)
+	if err != nil {
+		return err
 	}
 
 	log := slog.New(slog.NewTextHandler(stderr, nil))
@@ -113,6 +123,9 @@ func serve(args []string, stderr io.Writer) error {
 	if users == 0 {
 		return fmt.Errorf("no users yet. Create the first admin with:\n  ssshhh-env admin bootstrap --data-dir %s --name <you> --key ~/.ssh/id_ed25519.pub", dir)
 	}
+	if err := checkMasterKey(ctx, st, masterKey); err != nil {
+		return err
+	}
 	signer, created, err := server.LoadOrCreateHostKey(filepath.Join(dir, "host_ed25519"))
 	if err != nil {
 		return err
@@ -122,6 +135,7 @@ func serve(args []string, stderr io.Writer) error {
 	cfg.Addr = *addr
 	cfg.HostSigner = signer
 	cfg.Store = st
+	cfg.MasterKey = masterKey
 	cfg.Logger = log
 	srv, err := server.New(cfg)
 	if err != nil {
@@ -131,7 +145,7 @@ func serve(args []string, stderr io.Writer) error {
 	if created {
 		log.Info("generated new host key")
 	}
-	log.Info("starting", "addr", *addr, "host_key", auth.Fingerprint(signer.PublicKey()), "data_dir", dir, "users", users)
+	log.Info("starting", "addr", *addr, "host_key", auth.Fingerprint(signer.PublicKey()), "data_dir", dir, "users", users, "master_key_id", masterKey.ID())
 
 	errc := make(chan error, 1)
 	go func() { errc <- srv.ListenAndServe() }()

@@ -34,6 +34,32 @@ const (
 	RoleOwner
 )
 
+// roleNames are the names roles are stored and displayed under.
+var roleNames = map[Role]string{
+	RoleReader: "reader",
+	RoleWriter: "writer",
+	RoleOwner:  "owner",
+}
+
+// String returns the role's name, or "none".
+func (r Role) String() string {
+	if name, ok := roleNames[r]; ok {
+		return name
+	}
+	return "none"
+}
+
+// ParseRole returns the role called name. Anything it does not recognise is
+// RoleNone, which grants nothing.
+func ParseRole(name string) Role {
+	for r, n := range roleNames {
+		if n == name {
+			return r
+		}
+	}
+	return RoleNone
+}
+
 // Subject is the authenticated user making the request.
 type Subject struct {
 	IsAdmin  bool // server admin

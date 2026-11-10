@@ -4,7 +4,7 @@
 
 ssshhh-env is a self-hosted SSH server that lets a small team store, share and version its `.env` files. Teammates use the `ssh` client they already have, so there is nothing to install on their machines. Their SSH key is their identity, and you add a teammate by their GitHub username.
 
-> **Status: early development. Not usable yet.** The commands below show the planned interface. Don't store real secrets in it until v0.1 is released.
+> **Status: early development. Not usable yet.** The commands below show the planned interface; so far `init`, `push` and `pull` work (see [Development](#development)). Don't store real secrets in it until v0.1 is released.
 
 ## Planned usage
 
@@ -62,20 +62,29 @@ go test -race ./...
 
 Without Nix, install Go and use the same `go` commands.
 
-To run the server locally, create the first admin from your own public key, then start it:
+To run the server locally, create the first admin from your own public key, generate a master key, then start it:
 
 ```bash
 go build -o ssshhh-env ./cmd/ssshhh-env
 ./ssshhh-env admin bootstrap --name "$USER" --key ~/.ssh/id_ed25519.pub   # or: --github <username>
-./ssshhh-env serve                     # listens on :2222, prints the host key fingerprint
+./ssshhh-env keygen-master --out master.key                               # created with mode 0600
+./ssshhh-env serve --master-key-file master.key   # listens on :2222, prints the host key fingerprint
 
 ssh -p 2222 localhost whoami
+ssh -p 2222 localhost init myapp                  # server admins only; you become the owner
+ssh -p 2222 localhost push myapp < .env
+ssh -p 2222 localhost pull myapp | diff - .env    # no output: what you pull is what you pushed
+ssh -p 2222 localhost pull myapp --version 1
 ```
 
-`admin bootstrap` only works on the host and only while there are no users, so nobody can claim admin over the network. Everything lives in `data/` (mode `0700`): the SQLite database `ssshhh.db` and the host key. Every session and every failed login is recorded in the audit log:
+`admin bootstrap` only works on the host and only while there are no users, so nobody can claim admin over the network. The database `ssshhh.db` and the host key live in `data/` (mode `0700`).
+
+The master key encrypts every project's data key. The server refuses to start without it, if its file is readable by anyone else, or if it is not the key the database was encrypted with. You can pass it in the `SSSHHH_MASTER_KEY` environment variable instead of a file. **Keep it out of `data/` and back it up separately from the database:** a backup holding both is as good as unencrypted, and if the key is lost the secrets cannot be recovered.
+
+Pushed files are validated (`KEY=VALUE` lines, comments, blank lines, quoted values that may span lines; at most 256 KB) and stored exactly as sent. Every session and every failed login is recorded in the audit log, including each `pull`:
 
 ```bash
-sqlite3 -header -column data/ssshhh.db 'SELECT ts, user_id, remote_addr, action, result FROM audit_log'
+sqlite3 -header -column data/ssshhh.db 'SELECT ts, user_id, remote_addr, action, target, result, detail FROM audit_log'
 ```
 
 ## License

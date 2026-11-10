@@ -227,7 +227,7 @@ func TestBootstrapRefusesOpenDataDir(t *testing.T) {
 // Starting with no users fails with a hint, before the host key is created.
 func TestServeRefusesWithoutUsers(t *testing.T) {
 	dataDir := filepath.Join(t.TempDir(), "data")
-	code, _, stderr := cli("serve", "--data-dir", dataDir, "--addr", "127.0.0.1:0")
+	code, _, stderr := cli("serve", "--data-dir", dataDir, "--addr", "127.0.0.1:0", "--master-key-file", newMasterKeyFile(t))
 	if code == 0 || !strings.Contains(stderr, "admin bootstrap") {
 		t.Fatalf("exit %d, stderr %q", code, stderr)
 	}

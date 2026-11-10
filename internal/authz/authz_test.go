@@ -136,3 +136,22 @@ func TestPolicyRequirementsAreWellFormed(t *testing.T) {
 		}
 	}
 }
+
+func TestParseRole(t *testing.T) {
+	for _, r := range []Role{RoleReader, RoleWriter, RoleOwner} {
+		if got := ParseRole(r.String()); got != r {
+			t.Errorf("ParseRole(%q) = %s, want %s", r.String(), got, r)
+		}
+	}
+	// Anything unrecognised must grant nothing.
+	for _, name := range []string{"", "none", "admin", "Owner", "owner ", "OWNER", "root"} {
+		if got := ParseRole(name); got != RoleNone {
+			t.Errorf("ParseRole(%q) = %s, want none", name, got)
+		}
+	}
+	for _, r := range []Role{RoleNone, -1, RoleOwner + 1} {
+		if r.String() != "none" {
+			t.Errorf("Role(%d).String() = %q, want none", int(r), r.String())
+		}
+	}
+}
