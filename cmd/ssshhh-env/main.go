@@ -27,6 +27,7 @@ commands:
   serve           run the SSH server
   admin           server-side account management (run on the host)
   keygen-master   generate the master key that encrypts the database
+  version         print the version
 `
 
 func main() {
@@ -53,6 +54,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "ssshhh-env: %v\n", err)
 			return 1
 		}
+		return 0
+	case "version", "--version":
+		fmt.Fprintln(stdout, "ssshhh-env", versionString())
 		return 0
 	case "keygen-master":
 		if err := keygenMaster(args[1:], stdout, stderr); err != nil {
@@ -126,6 +130,10 @@ func serve(args []string, stderr io.Writer) error {
 	if err := checkMasterKey(ctx, st, masterKey); err != nil {
 		return err
 	}
+	warning, err := backupWarning(ctx, st, masterKey, dir)
+	if err != nil {
+		return err
+	}
 	signer, created, err := server.LoadOrCreateHostKey(filepath.Join(dir, "host_ed25519"))
 	if err != nil {
 		return err
@@ -145,7 +153,10 @@ func serve(args []string, stderr io.Writer) error {
 	if created {
 		log.Info("generated new host key")
 	}
-	log.Info("starting", "addr", *addr, "host_key", auth.Fingerprint(signer.PublicKey()), "data_dir", dir, "users", users, "master_key_id", masterKey.ID())
+	if warning != "" {
+		log.Warn(warning)
+	}
+	log.Info("starting", "version", versionString(), "addr", *addr, "host_key", auth.Fingerprint(signer.PublicKey()), "data_dir", dir, "users", users, "master_key_id", masterKey.ID())
 
 	errc := make(chan error, 1)
 	go func() { errc <- srv.ListenAndServe() }()

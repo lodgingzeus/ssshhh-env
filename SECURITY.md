@@ -27,4 +27,4 @@ Before v1.0, only the latest release receives security fixes.
 - Once a secret is pulled to a laptop, it is outside our control. After revoking someone, rotate
   the secrets they had access to.
 
-More detail is in the [README](README.md#trust-model).
+More detail is in the [README](README.md#trust-model-and-limits).

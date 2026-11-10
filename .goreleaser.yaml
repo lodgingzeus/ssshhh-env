@@ -1,0 +1,62 @@
+# Release config. Run by .github/workflows/release.yml on a v* tag.
+# Local dry run: goreleaser release --snapshot --clean
+version: 2
+
+project_name: ssshhh-env
+
+before:
+  hooks:
+    - go mod verify
+
+builds:
+  - id: ssshhh-env
+    main: ./cmd/ssshhh-env
+    binary: ssshhh-env
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    # No Windows build: the server refuses a data directory or key file that
+    # others can read, and Windows has no Unix modes to check, so it could
+    # never start. Teammates on Windows only need an ssh client.
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    # Same commit, same bytes.
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - formats: [tar.gz]
+    # No version in the name, so .../releases/latest/download/<name> is a
+    # stable URL for the README.
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+      - SECURITY.md
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+sboms:
+  - artifacts: archive
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^Merge "
+
+release:
+  # Published by hand after checking it. Tags like v1.3.0-rc.1 are marked as
+  # pre-releases, so .../releases/latest never points at one.
+  draft: true
+  prerelease: auto
+  footer: |
+    Verify a download before running it:
+
+        sha256sum --ignore-missing -c checksums.txt
+        gh attestation verify <archive> --repo {{ .Env.GITHUB_REPOSITORY }}

@@ -1,0 +1,24 @@
+# Example deployment. See "Run with Docker" in README.md first: the data
+# directory and master key must exist before the first `docker compose up`.
+#
+#   SSSHHH_UID=$(id -u) SSSHHH_GID=$(id -g) docker compose up -d
+services:
+  ssshhh-env:
+    image: ghcr.io/lodgingzeus/ssshhh-env:latest
+    command: ["serve", "--data-dir", "/data", "--master-key-file", "/run/secrets/master.key"]
+    # Same owner as ./ssshhh-data and ./master.key, so both can stay private
+    # (0700 and 0600) on the host.
+    user: "${SSSHHH_UID:-1000}:${SSSHHH_GID:-1000}"
+    ports:
+      - "2222:2222"
+    volumes:
+      - ./ssshhh-data:/data
+      - ./master.key:/run/secrets/master.key:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped

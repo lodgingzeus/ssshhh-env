@@ -16,6 +16,7 @@ jobs:
         with:
           persist-credentials: false
 
+      # The minimum Go version from go.mod, so it is known to still work.
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
@@ -31,3 +32,70 @@ jobs:
 
       - name: Test
         run: go test -race ./...
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Latest Go: govulncheck reports standard library vulnerabilities for
+      # the toolchain it runs on, which should be the one releases use.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          check-latest: true
+
+      # Tools are pinned to exact versions and verified by the Go checksum
+      # database when downloaded.
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
+
+      - name: gosec
+        run: go run github.com/securego/gosec/v2/cmd/gosec@v2.30.0 -quiet ./...
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { pkg: ./internal/envfile, target: FuzzParse }
+          - { pkg: ./internal/envfile, target: FuzzDiff }
+          - { pkg: ./internal/commands, target: FuzzParseTarget }
+          - { pkg: ./internal/commands, target: FuzzParseArgs }
+          - { pkg: ./internal/commands, target: FuzzAfterWords }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      # A short smoke run per target: catches regressions, not deep bugs.
+      - name: Fuzz ${{ matrix.target }}
+        env:
+          PKG: ${{ matrix.pkg }}
+          TARGET: ${{ matrix.target }}
+        run: go test -run '^$' -fuzz "^${TARGET}\$" -fuzztime 30s "$PKG"
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build image
+        run: docker build -t ssshhh-env:ci .
+
+      - name: Image runs as non-root with a private data directory
+        run: |
+          test "$(docker image inspect -f '{{.Config.User}}' ssshhh-env:ci)" = "65532:65532"
+          docker run --rm --read-only --cap-drop ALL ssshhh-env:ci version

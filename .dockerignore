@@ -1,0 +1,7 @@
+# Allowlist: only the Go sources reach the build context. Anything else in
+# the working tree (data/, master.key, .env files, notes) stays out of it.
+*
+!go.mod
+!go.sum
+!cmd/
+!internal/

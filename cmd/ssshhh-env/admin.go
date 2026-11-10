@@ -25,7 +25,8 @@ var githubClient = github.Client{}
 const adminUsage = `usage: ssshhh-env admin <command> [flags]
 
 commands:
-  bootstrap   create the first admin user (only works while there are no users)
+  bootstrap        create the first admin user (only works while there are no users)
+  confirm-backup   record that the master key is backed up (stops the startup warning)
 `
 
 func admin(args []string, stdout, stderr io.Writer) error {
@@ -38,6 +39,8 @@ func admin(args []string, stdout, stderr io.Writer) error {
 		return nil
 	case "bootstrap":
 		return bootstrap(args[1:], stdout, stderr)
+	case "confirm-backup":
+		return confirmBackup(args[1:], stdout, stderr)
 	default:
 		return fmt.Errorf("admin: unknown command %q\n\n%s", args[0], strings.TrimSpace(adminUsage))
 	}
