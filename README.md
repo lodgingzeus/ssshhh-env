@@ -62,15 +62,20 @@ go test -race ./...
 
 Without Nix, install Go and use the same `go` commands.
 
-To run the server locally, allow your own key, then start it:
+To run the server locally, create the first admin from your own public key, then start it:
 
 ```bash
-mkdir -m 700 data
-echo "$(cut -d' ' -f1,2 ~/.ssh/id_ed25519.pub) $USER" > data/authorized_keys
-chmod 600 data/authorized_keys
-go run ./cmd/ssshhh-env serve          # listens on :2222, prints the host key fingerprint
+go build -o ssshhh-env ./cmd/ssshhh-env
+./ssshhh-env admin bootstrap --name "$USER" --key ~/.ssh/id_ed25519.pub   # or: --github <username>
+./ssshhh-env serve                     # listens on :2222, prints the host key fingerprint
 
 ssh -p 2222 localhost whoami
+```
+
+`admin bootstrap` only works on the host and only while there are no users, so nobody can claim admin over the network. Everything lives in `data/` (mode `0700`): the SQLite database `ssshhh.db` and the host key. Every session and every failed login is recorded in the audit log:
+
+```bash
+sqlite3 -header -column data/ssshhh.db 'SELECT ts, user_id, remote_addr, action, result FROM audit_log'
 ```
 
 ## License

@@ -2,6 +2,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"net"
@@ -12,15 +13,17 @@ import (
 	gossh "golang.org/x/crypto/ssh"
 	"golang.org/x/time/rate"
 
+	"github.com/lodgingzeus/ssshhh-env/internal/audit"
 	"github.com/lodgingzeus/ssshhh-env/internal/auth"
 	"github.com/lodgingzeus/ssshhh-env/internal/commands"
+	"github.com/lodgingzeus/ssshhh-env/internal/store"
 )
 
 // Config holds the server settings. Start from DefaultConfig.
 type Config struct {
 	Addr       string
 	HostSigner gossh.Signer
-	Allowlist  *auth.Allowlist
+	Store      *store.Store
 	Logger     *slog.Logger
 
 	HandshakeTimeout time.Duration // until authentication completes
@@ -53,6 +56,10 @@ func DefaultConfig() Config {
 // maxTrackedIPs bounds the rate limiter's memory.
 const maxTrackedIPs = 10_000
 
+// auditTimeout bounds one audit write. Audit writes don't use the
+// connection's context: they must still happen as it is being torn down.
+const auditTimeout = 5 * time.Second
+
 // Session request types refused on every session channel. Most are already
 // refused by the library's defaults; filtering them here does not depend on
 // those defaults. Agent forwarding is accepted by the library, so this
@@ -66,15 +73,15 @@ var deniedSessionRequests = map[string]bool{
 
 type sessionCountKey struct{}
 
-// New builds the SSH server. Only public-key auth against the allowlist is
-// accepted, and only "session" channels running allowlisted commands are
+// New builds the SSH server. Only public-key auth against the keys
+// registered in the store is accepted, and only "session" channels running allowlisted commands are
 // served: no shell, PTY, subsystems or forwarding of any kind.
 func New(cfg Config) (*ssh.Server, error) {
 	if cfg.HostSigner == nil {
 		return nil, errors.New("server: host key required")
 	}
-	if cfg.Allowlist == nil {
-		return nil, errors.New("server: allowlist required")
+	if cfg.Store == nil {
+		return nil, errors.New("server: store required")
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -91,12 +98,12 @@ func New(cfg Config) (*ssh.Server, error) {
 		// the private key. It must only answer yes/no: no logging of
 		// success, no state. Identity is taken from the session, which only
 		// exists after the signature has been verified.
-		PublicKeyHandler: func(_ ssh.Context, key ssh.PublicKey) bool {
-			if auth.CheckKeyPolicy(key) != nil {
-				return false
+		PublicKeyHandler: func(ctx ssh.Context, key ssh.PublicKey) bool {
+			_, err := auth.Lookup(ctx, cfg.Store, key)
+			if err != nil && !isAuthRefusal(err) {
+				log.Error("key lookup failed", "err", err)
 			}
-			_, ok := cfg.Allowlist.Lookup(key)
-			return ok
+			return err == nil
 		},
 		PtyCallback: func(ssh.Context, ssh.Pty) bool { return false },
 
@@ -111,7 +118,20 @@ func New(cfg Config) (*ssh.Server, error) {
 			return &limitedConn{Conn: conn, release: release}
 		},
 		ConnectionFailedCallback: func(conn net.Conn, err error) {
-			log.Info("connection failed", "remote", remoteIP(conn.RemoteAddr()), "err", err)
+			ip := remoteIP(conn.RemoteAddr())
+			log.Info("connection failed", "remote", ip, "err", err)
+			// Only failed authentication is audited; port scans and
+			// timeouts are not. Connections are rate limited per IP, which
+			// bounds how fast these rows can be written.
+			var authErr *gossh.ServerAuthError
+			if errors.As(err, &authErr) {
+				writeAudit(cfg.Store, log, audit.Event{
+					RemoteAddr: ip,
+					Action:     "auth",
+					Result:     audit.Denied,
+					Detail:     "authentication failed",
+				})
+			}
 		},
 
 		HandshakeTimeout: cfg.HandshakeTimeout,
@@ -124,30 +144,74 @@ func New(cfg Config) (*ssh.Server, error) {
 		RequestHandlers:   map[string]ssh.RequestHandler{},
 		SubsystemHandlers: map[string]ssh.SubsystemHandler{},
 
-		Handler: sessionHandler(cfg.Allowlist, log),
+		Handler: sessionHandler(cfg.Store, log),
 	}
 	return srv, nil
 }
 
-func sessionHandler(allow *auth.Allowlist, log *slog.Logger) ssh.Handler {
+// isAuthRefusal reports whether err is an expected "no" from auth.Lookup,
+// as opposed to a storage failure.
+func isAuthRefusal(err error) bool {
+	return errors.Is(err, auth.ErrUnknownKey) || errors.Is(err, auth.ErrUserDisabled) || errors.Is(err, auth.ErrWeakKey)
+}
+
+// writeAudit records e and reports whether it was written.
+func writeAudit(st *store.Store, log *slog.Logger, e audit.Event) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), auditTimeout)
+	defer cancel()
+	if err := audit.Log(ctx, st, e); err != nil {
+		log.Error("audit write failed", "action", e.Action, "err", err)
+		return false
+	}
+	return true
+}
+
+func sessionHandler(st *store.Store, log *slog.Logger) ssh.Handler {
 	return func(s ssh.Session) {
 		ip := remoteIP(s.RemoteAddr())
-		// s.PublicKey() is the key whose signature was verified.
-		id, ok := allow.Lookup(s.PublicKey())
-		if !ok {
-			log.Error("session without an allowed key", "remote", ip)
+		// s.PublicKey() is the key whose signature was verified. Looking it
+		// up again here, per session, means a user disabled or a key
+		// removed after the connection was made is refused straight away.
+		id, err := auth.Lookup(s.Context(), st, s.PublicKey())
+		if err != nil {
+			fp := ""
+			if pub := s.PublicKey(); pub != nil {
+				fp = auth.Fingerprint(pub)
+			}
+			if isAuthRefusal(err) {
+				log.Warn("session refused", "remote", ip, "fingerprint", fp, "reason", err)
+				writeAudit(st, log, audit.Event{KeyFingerprint: fp, RemoteAddr: ip, Action: "session", Result: audit.Denied, Detail: err.Error()})
+			} else {
+				log.Error("key lookup failed", "remote", ip, "err", err)
+				writeAudit(st, log, audit.Event{KeyFingerprint: fp, RemoteAddr: ip, Action: "session", Result: audit.Error, Detail: "key lookup failed"})
+			}
 			_ = s.Exit(1)
 			return
 		}
+		if err := st.TouchKey(s.Context(), id.KeyID); err != nil {
+			log.Error("update last_used_at failed", "err", err)
+		}
+
 		args := s.Command()
 		if len(args) == 0 && s.RawCommand() != "" {
 			args = []string{""} // unparseable command line: treat as unknown
 		}
 		name := commands.Name(args)
-		code := commands.Run(args, id, s, s.Stderr())
-		// Log the command name only, never the raw command line: it may
+		code, result := commands.Run(args, id, s, s.Stderr())
+		// Record the command name only, never the raw command line: it may
 		// contain secrets typed by mistake.
-		log.Info("session", "user", id.Name, "fingerprint", id.Fingerprint, "remote", ip, "cmd", name, "exit", code)
+		log.Info("session", "user", id.Name, "fingerprint", id.Fingerprint, "remote", ip, "cmd", name, "result", string(result), "exit", code)
+		ok := writeAudit(st, log, audit.Event{
+			UserID:         id.UserID,
+			KeyFingerprint: id.Fingerprint,
+			RemoteAddr:     ip,
+			Action:         name,
+			Result:         result,
+		})
+		if !ok && code == 0 {
+			// An action that could not be audited must not look successful.
+			code = 1
+		}
 		_ = s.Exit(code)
 	}
 }

@@ -2,13 +2,13 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
 	"io"
 	"log/slog"
 	"net"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -19,6 +19,7 @@ import (
 	"golang.org/x/time/rate"
 
 	"github.com/lodgingzeus/ssshhh-env/internal/auth"
+	"github.com/lodgingzeus/ssshhh-env/internal/store"
 )
 
 // syncBuffer is a goroutine-safe log sink.
@@ -42,8 +43,40 @@ func (s *syncBuffer) String() string {
 type testServer struct {
 	addr    string
 	hostKey gossh.PublicKey
-	alice   gossh.Signer // allowlisted as "alice"
+	alice   gossh.Signer // registered as "alice", not an admin
+	users   map[string]store.User
+	st      *store.Store
 	logs    *syncBuffer
+}
+
+// audit returns the audit log, oldest first.
+func (ts *testServer) audit(t *testing.T) []store.AuditRow {
+	t.Helper()
+	rows, err := ts.st.ListAudit(context.Background(), 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
+		rows[i], rows[j] = rows[j], rows[i]
+	}
+	return rows
+}
+
+// waitAudit waits for an audit row matching want. Rows for failed
+// connections are written after the client has already seen the failure.
+func (ts *testServer) waitAudit(t *testing.T, want func(store.AuditRow) bool) store.AuditRow {
+	t.Helper()
+	var found store.AuditRow
+	eventually(t, func() error {
+		for _, r := range ts.audit(t) {
+			if want(r) {
+				found = r
+				return nil
+			}
+		}
+		return errors.New("no matching audit row")
+	})
+	return found
 }
 
 func newSigner(t *testing.T) gossh.Signer {
@@ -64,7 +97,7 @@ func startServer(t *testing.T, modify func(*Config)) *testServer {
 	return startServerWithKeys(t, nil, modify)
 }
 
-// startServerWithKeys allowlists a generated "alice" plus extra keys by name.
+// startServerWithKeys registers a generated "alice" plus extra users by name.
 func startServerWithKeys(t *testing.T, extra map[string]gossh.PublicKey, modify func(*Config)) *testServer {
 	t.Helper()
 	dir := t.TempDir()
@@ -78,24 +111,29 @@ func startServerWithKeys(t *testing.T, extra map[string]gossh.PublicKey, modify 
 	for name, k := range extra {
 		keys[name] = k
 	}
-	var lines strings.Builder
-	for name, k := range keys {
-		lines.WriteString(strings.TrimSpace(string(gossh.MarshalAuthorizedKey(k))) + " " + name + "\n")
-	}
-	allowPath := filepath.Join(dir, "authorized_keys")
-	if err := os.WriteFile(allowPath, []byte(lines.String()), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	allow, err := auth.LoadAllowlist(allowPath)
+	st, err := store.Open(context.Background(), filepath.Join(dir, "test.db"))
 	if err != nil {
 		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	users := map[string]store.User{}
+	for name, k := range keys {
+		nk, err := auth.NewKey(k, store.SourceManual)
+		if err != nil {
+			t.Fatal(err)
+		}
+		u, err := st.CreateUser(context.Background(), store.NewUser{Name: name}, []store.NewKey{nk})
+		if err != nil {
+			t.Fatal(err)
+		}
+		users[name] = u
 	}
 
 	logs := &syncBuffer{}
 	cfg := DefaultConfig()
 	cfg.Addr = ""
 	cfg.HostSigner = host
-	cfg.Allowlist = allow
+	cfg.Store = st
 	cfg.Logger = slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	cfg.ConnRate = rate.Inf
 	if modify != nil {
@@ -112,7 +150,7 @@ func startServerWithKeys(t *testing.T, extra map[string]gossh.PublicKey, modify 
 	go func() { _ = srv.Serve(ln) }()
 	t.Cleanup(func() { _ = srv.Close() })
 
-	return &testServer{addr: ln.Addr().String(), hostKey: host.PublicKey(), alice: alice, logs: logs}
+	return &testServer{addr: ln.Addr().String(), hostKey: host.PublicKey(), alice: alice, users: users, st: st, logs: logs}
 }
 
 func (ts *testServer) dial(auths ...gossh.AuthMethod) (*gossh.Client, error) {
@@ -405,6 +443,15 @@ func TestRawCommandNeverLogged(t *testing.T) {
 	if strings.Contains(ts.logs.String(), canary) {
 		t.Fatalf("raw command line leaked into logs:\n%s", ts.logs.String())
 	}
+	rows := ts.audit(t)
+	if len(rows) != 4 {
+		t.Fatalf("audit rows = %d, want 4", len(rows))
+	}
+	for _, r := range rows {
+		if strings.Contains(r.Action+r.Target+r.Detail, canary) {
+			t.Fatalf("raw command line leaked into the audit log: %+v", r)
+		}
+	}
 }
 
 // lyingSigner advertises one public key but signs with a different one, so
@@ -437,8 +484,143 @@ func TestBadSignatureEndsConnection(t *testing.T) {
 	}
 }
 
-func TestNewRequiresHostKeyAndAllowlist(t *testing.T) {
+func TestNewRequiresHostKeyAndStore(t *testing.T) {
 	if _, err := New(DefaultConfig()); err == nil {
-		t.Fatal("New without host key or allowlist succeeded")
+		t.Fatal("New without host key or store succeeded")
+	}
+}
+
+func TestSessionsAreAudited(t *testing.T) {
+	ts := startServer(t, nil)
+	c := ts.dialAlice(t)
+	fp := auth.Fingerprint(ts.alice.PublicKey())
+	for _, cmd := range []string{"whoami", "", "whoami extra", "bash -c id"} {
+		if cmd == "" {
+			s := newSession(t, c)
+			if err := s.Shell(); err != nil {
+				t.Fatal(err)
+			}
+			_ = s.Wait()
+			continue
+		}
+		runCmd(t, c, cmd)
+	}
+
+	want := []struct{ action, result string }{
+		{"whoami", "ok"}, {"help", "ok"}, {"whoami", "error"}, {"unknown", "error"},
+	}
+	rows := ts.audit(t)
+	if len(rows) != len(want) {
+		t.Fatalf("audit rows = %d, want %d: %+v", len(rows), len(want), rows)
+	}
+	for i, w := range want {
+		r := rows[i]
+		if r.Action != w.action || r.Result != w.result {
+			t.Errorf("row %d = %s/%s, want %s/%s", i, r.Action, r.Result, w.action, w.result)
+		}
+		if r.UserID != ts.users["alice"].ID || r.KeyFingerprint != fp || r.RemoteAddr != "127.0.0.1" || r.Time == "" {
+			t.Errorf("row %d = %+v", i, r)
+		}
+	}
+}
+
+func TestFailedAuthIsAudited(t *testing.T) {
+	ts := startServer(t, nil)
+	if c, err := ts.dial(gossh.PublicKeys(newSigner(t))); err == nil {
+		c.Close()
+		t.Fatal("unregistered key accepted")
+	}
+	r := ts.waitAudit(t, func(r store.AuditRow) bool { return r.Action == "auth" })
+	if r.Result != "denied" || r.UserID != 0 || r.RemoteAddr != "127.0.0.1" {
+		t.Fatalf("row = %+v", r)
+	}
+}
+
+// A connection that never tries to authenticate is not an auth failure and
+// must not be able to fill the audit log.
+func TestSilentConnectionIsNotAudited(t *testing.T) {
+	ts := startServer(t, func(c *Config) { c.HandshakeTimeout = 200 * time.Millisecond })
+	conn, err := net.Dial("tcp", ts.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_, _ = io.Copy(io.Discard, conn)
+	eventually(t, func() error {
+		if !strings.Contains(ts.logs.String(), "connection failed") {
+			return errors.New("failure not logged yet")
+		}
+		return nil
+	})
+	if rows := ts.audit(t); len(rows) != 0 {
+		t.Fatalf("audit rows = %+v, want none", rows)
+	}
+}
+
+func TestDisabledUserRefused(t *testing.T) {
+	bob := newSigner(t)
+	ts := startServerWithKeys(t, map[string]gossh.PublicKey{"bob": bob.PublicKey()}, nil)
+
+	// Connect first, then get disabled: the open connection must stop
+	// working at the next command.
+	c, err := ts.dial(gossh.PublicKeys(bob))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if out, _, code := runCmd(t, c, "whoami"); code != 0 || !strings.Contains(out, "bob") {
+		t.Fatalf("before disable: exit %d, out %q", code, out)
+	}
+	if err := ts.st.DisableUser(context.Background(), ts.users["bob"].ID); err != nil {
+		t.Fatal(err)
+	}
+	out, _, code := runCmd(t, c, "whoami")
+	if code == 0 || strings.Contains(out, "bob") {
+		t.Fatalf("after disable: exit %d, out %q", code, out)
+	}
+	r := ts.waitAudit(t, func(r store.AuditRow) bool { return r.Action == "session" })
+	if r.Result != "denied" || r.KeyFingerprint != auth.Fingerprint(bob.PublicKey()) {
+		t.Fatalf("row = %+v", r)
+	}
+
+	// New connections are refused at authentication.
+	if c, err := ts.dial(gossh.PublicKeys(bob)); err == nil {
+		c.Close()
+		t.Fatal("disabled user authenticated")
+	}
+	ts.waitAudit(t, func(r store.AuditRow) bool { return r.Action == "auth" && r.Result == "denied" })
+
+	// Other users are unaffected.
+	if _, _, code := runCmd(t, ts.dialAlice(t), "whoami"); code != 0 {
+		t.Fatalf("alice: exit %d", code)
+	}
+}
+
+func TestLastUsedAtUpdated(t *testing.T) {
+	ts := startServer(t, nil)
+	fp := auth.Fingerprint(ts.alice.PublicKey())
+	k, _, err := ts.st.KeyByFingerprint(context.Background(), fp)
+	if err != nil || k.LastUsedAt != "" {
+		t.Fatalf("before: last used %q, err %v", k.LastUsedAt, err)
+	}
+	runCmd(t, ts.dialAlice(t), "whoami")
+	k, _, err = ts.st.KeyByFingerprint(context.Background(), fp)
+	if err != nil || k.LastUsedAt == "" {
+		t.Fatalf("after: last used %q, err %v", k.LastUsedAt, err)
+	}
+}
+
+// If the audit log can't be written, a command must not report success.
+func TestAuditFailureFailsCommand(t *testing.T) {
+	ts := startServer(t, nil)
+	c := ts.dialAlice(t)
+	if _, _, code := runCmd(t, c, "whoami"); code != 0 {
+		t.Fatalf("exit = %d", code)
+	}
+	_ = ts.st.Close()
+	s := newSession(t, c)
+	if err := s.Run("whoami"); err == nil {
+		t.Fatal("command succeeded with the audit log unavailable")
 	}
 }

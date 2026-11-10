@@ -1,18 +1,20 @@
 package auth
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"errors"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	gossh "golang.org/x/crypto/ssh"
+
+	"github.com/lodgingzeus/ssshhh-env/internal/store"
 )
 
 func pubFrom(t *testing.T, key any) gossh.PublicKey {
@@ -90,70 +92,151 @@ func TestCheckKeyPolicyRejectsCertificates(t *testing.T) {
 	}
 }
 
-func TestParseAllowlist(t *testing.T) {
-	alice := ed25519Pub(t)
-	bob := ed25519Pub(t)
-	stranger := ed25519Pub(t)
-
-	data := "# comment\n\n" + authorizedLine(alice, "alice") + "\n" + authorizedLine(bob, "bob@laptop") + "\n"
-	a, err := parseAllowlist([]byte(data))
+func openStore(t *testing.T) *store.Store {
+	t.Helper()
+	st, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a.Len() != 2 {
-		t.Fatalf("Len = %d, want 2", a.Len())
+	t.Cleanup(func() { _ = st.Close() })
+	return st
+}
+
+func addUser(t *testing.T, st *store.Store, name string, admin bool, pubs ...gossh.PublicKey) store.User {
+	t.Helper()
+	var keys []store.NewKey
+	for _, pub := range pubs {
+		k, err := NewKey(pub, store.SourceManual)
+		if err != nil {
+			t.Fatal(err)
+		}
+		keys = append(keys, k)
 	}
-	id, ok := a.Lookup(alice)
-	if !ok || id.Name != "alice" || id.Fingerprint != Fingerprint(alice) || id.KeyType != gossh.KeyAlgoED25519 {
-		t.Fatalf("Lookup(alice) = %+v, %v", id, ok)
+	u, err := st.CreateUser(context.Background(), store.NewUser{Name: name, IsAdmin: admin}, keys)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if id, ok := a.Lookup(bob); !ok || id.Name != "bob@laptop" {
-		t.Fatalf("Lookup(bob) = %+v, %v", id, ok)
+	return u
+}
+
+func TestLookup(t *testing.T) {
+	ctx := context.Background()
+	st := openStore(t)
+	alice1, alice2, bob := ed25519Pub(t), ed25519Pub(t), ed25519Pub(t)
+	alice := addUser(t, st, "alice", true, alice1, alice2)
+	bobUser := addUser(t, st, "bob", false, bob)
+
+	for _, pub := range []gossh.PublicKey{alice1, alice2} {
+		id, err := Lookup(ctx, st, pub)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if id.UserID != alice.ID || id.Name != "alice" || !id.IsAdmin || id.KeyID == 0 ||
+			id.Fingerprint != Fingerprint(pub) || id.KeyType != gossh.KeyAlgoED25519 {
+			t.Fatalf("Lookup = %+v", id)
+		}
 	}
-	if _, ok := a.Lookup(stranger); ok {
-		t.Fatal("stranger allowed")
+	if id, err := Lookup(ctx, st, bob); err != nil || id.Name != "bob" || id.IsAdmin {
+		t.Fatalf("Lookup(bob) = %+v, %v", id, err)
 	}
-	if _, ok := a.Lookup(nil); ok {
-		t.Fatal("nil key allowed")
+	if _, err := Lookup(ctx, st, ed25519Pub(t)); !errors.Is(err, ErrUnknownKey) {
+		t.Fatalf("stranger: err = %v", err)
+	}
+	if _, err := Lookup(ctx, st, nil); !errors.Is(err, ErrUnknownKey) {
+		t.Fatalf("nil key: err = %v", err)
+	}
+
+	if err := st.DisableUser(ctx, bobUser.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Lookup(ctx, st, bob); !errors.Is(err, ErrUserDisabled) {
+		t.Fatalf("disabled user: err = %v", err)
+	}
+	if _, err := Lookup(ctx, st, alice1); err != nil {
+		t.Fatalf("disabling bob affected alice: %v", err)
 	}
 }
 
-func TestParseAllowlistRejects(t *testing.T) {
-	k := ed25519Pub(t)
-	tests := map[string]string{
-		"weak rsa":       authorizedLine(rsaPub(t, 2048), "weak"),
-		"options":        `command="/bin/sh" ` + authorizedLine(k, "opt"),
-		"no name":        strings.TrimSpace(string(gossh.MarshalAuthorizedKey(k))),
-		"control chars":  authorizedLine(k, "evil\x1b[31m"),
-		"duplicate":      authorizedLine(k, "a") + "\n" + authorizedLine(k, "b"),
-		"garbage":        "not a key",
-		"name too long":  authorizedLine(k, strings.Repeat("a", 65)),
-		"leading symbol": authorizedLine(k, "-rf"),
+// A weak key is refused even if it somehow got into the database.
+func TestLookupAppliesPolicyToStoredKeys(t *testing.T) {
+	ctx := context.Background()
+	st := openStore(t)
+	weak := rsaPub(t, 2048)
+	if _, err := NewKey(weak, store.SourceManual); !errors.Is(err, ErrWeakKey) {
+		t.Fatalf("NewKey(weak): err = %v", err)
 	}
-	for name, data := range tests {
-		t.Run(name, func(t *testing.T) {
-			if _, err := parseAllowlist([]byte(data)); err == nil {
-				t.Fatal("want error")
-			}
-		})
+	if _, err := st.CreateUser(ctx, store.NewUser{Name: "old"}, []store.NewKey{{
+		Fingerprint: Fingerprint(weak), PublicKey: MarshalKey(weak), KeyType: weak.Type(), Source: store.SourceManual,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Lookup(ctx, st, weak); !errors.Is(err, ErrWeakKey) {
+		t.Fatalf("err = %v, want ErrWeakKey", err)
 	}
 }
 
-func TestLoadAllowlistPermissions(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "authorized_keys")
-	if err := os.WriteFile(path, []byte(authorizedLine(ed25519Pub(t), "alice")+"\n"), 0o600); err != nil {
+// fakeKeys returns a fixed row whatever fingerprint is asked for.
+type fakeKeys struct {
+	key store.Key
+	err error
+}
+
+func (f fakeKeys) KeyByFingerprint(context.Context, string) (store.Key, store.User, error) {
+	return f.key, store.User{ID: 1, Name: "victim"}, f.err
+}
+
+func TestLookupFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	pub, other := ed25519Pub(t), ed25519Pub(t)
+
+	// The stored key differs from the presented one.
+	mismatch := fakeKeys{key: store.Key{ID: 1, UserID: 1, Fingerprint: Fingerprint(pub), PublicKey: MarshalKey(other)}}
+	if _, err := Lookup(ctx, mismatch, pub); !errors.Is(err, ErrUnknownKey) {
+		t.Fatalf("mismatched key: err = %v", err)
+	}
+	// A storage failure is an error, never an identity.
+	broken := fakeKeys{err: errors.New("disk on fire")}
+	if id, err := Lookup(ctx, broken, pub); err == nil || id != (Identity{}) {
+		t.Fatalf("storage failure: id = %+v, err = %v", id, err)
+	}
+}
+
+func TestParsePublicKeys(t *testing.T) {
+	a, b := ed25519Pub(t), ed25519Pub(t)
+	data := "# comment\n\n" + authorizedLine(a, "alice@laptop") + "\n" + MarshalKey(b) + "\n" + MarshalKey(a) + "\n"
+	keys, err := ParsePublicKeys([]byte(data))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := LoadAllowlist(path); err != nil {
-		t.Fatalf("0600: %v", err)
+	if len(keys) != 2 || Fingerprint(keys[0]) != Fingerprint(a) || Fingerprint(keys[1]) != Fingerprint(b) {
+		t.Fatalf("got %d keys", len(keys))
 	}
-	if err := os.Chmod(path, 0o620); err != nil {
-		t.Fatal(err)
+	if keys, err := ParsePublicKeys([]byte("\n# nothing\n")); err != nil || len(keys) != 0 {
+		t.Fatalf("empty input: %d keys, err = %v", len(keys), err)
 	}
-	if _, err := LoadAllowlist(path); err == nil {
-		t.Fatal("group-writable file accepted")
+	for name, bad := range map[string]string{
+		"garbage":     "not a key",
+		"options":     `command="/bin/sh" ` + MarshalKey(a),
+		"private key": "-----BEGIN OPENSSH PRIVATE KEY-----",
+	} {
+		_, err := ParsePublicKeys([]byte(bad))
+		if err == nil {
+			t.Errorf("%s: accepted", name)
+		} else if strings.Contains(err.Error(), "BEGIN") {
+			t.Errorf("%s: error echoes the input: %v", name, err)
+		}
 	}
-	if _, err := LoadAllowlist(filepath.Join(t.TempDir(), "missing")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("missing file: got %v", err)
+}
+
+func TestValidName(t *testing.T) {
+	for _, ok := range []string{"alice", "Alice-2", "a", "bob.smith_x", strings.Repeat("a", 64)} {
+		if !ValidName(ok) {
+			t.Errorf("%q refused", ok)
+		}
+	}
+	for _, bad := range []string{"", "-rf", ".hidden", "evil\x1b[31m", "two words", "a/b", "a@b", strings.Repeat("a", 65), "alice\n"} {
+		if ValidName(bad) {
+			t.Errorf("%q accepted", bad)
+		}
 	}
 }
